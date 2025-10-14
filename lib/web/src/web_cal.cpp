@@ -1,5 +1,7 @@
 #include "web_cal.h"
 #include <vector>
+#include "shared.h"
+#include "io.h"
 
 /*
 ===============================================================================
@@ -10,6 +12,11 @@
       POST /api/cal/clear   (ch=atr|vent)
       GET  /api/cal/list
       GET  /api/cal/fit     (ch=atr|vent)
+  - Manual raw control for calibration:
+      POST /api/pwm   (duty=0..255) — applies raw PWM immediately,
+          sets G.overrideOutputs=1 and refreshes G.overrideUntilMs = now+3000ms.
+      POST /api/valve (dir=0|1)     — applies raw valve dir immediately,
+          same override behavior as above.
 ===============================================================================
 */
 
@@ -42,7 +49,7 @@ static CalFit fit(const std::vector<CalPoint>& v){
   return f;
 }
 
-// --- Embedded page (unchanged layout, small comment cleanups) ---
+// --- Embedded page (unchanged layout) ---
 static const char CAL_HTML[] PROGMEM = R"HTML(
 <!doctype html><meta charset="utf-8">
 <title>Calibration</title>
@@ -65,8 +72,8 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
     <h3>Manual control</h3>
     <div class="row">
       <label>Valve (mode):</label>
-      <button class="btn" onclick="setValve(0)">0 (Forward)</button>
-      <button class="btn" onclick="setValve(1)">1 (Reverse)</button>
+      <button class="btn" onclick="setValve(0)">0 (Reverse)</button>
+      <button class="btn" onclick="setValve(1)">1 (Forward)</button>
       <span id="valveState" class="muted"></span>
     </div>
     <div class="row">
@@ -76,7 +83,7 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
       <span id="pwmState" class="muted"></span>
     </div>
     <div class="row">
-      <button id="pp" class="btn" onclick="toggleRun()">Play</button>
+      <button id="pp" class="btn" onclick="toggleRun()">Play/Pause</button>
       <span class="muted">(Play/Pause)</span>
     </div>
   </div>
@@ -144,26 +151,22 @@ loopMs=${d.loopMs}`;
   }catch(e){ pre.textContent = 'SSE not supported'; }
 })();
 
-/* Manual controls wired to existing endpoints */
-async function setValve(m){
-  await fetch(`/api/mode?m=${m}`).catch(()=>{});
-  document.getElementById('valveState').textContent = 'mode=' + m;
+/* Manual controls: RAW hardware override for calibration only */
+async function setValve(dir){
+  dir = (+dir) ? 1 : 0;
+  const headers = {'Content-Type':'application/x-www-form-urlencoded'};
+  const r = await fetch('/api/valve', {method:'POST', headers, body:new URLSearchParams({dir:String(dir)})}).catch(()=>null);
+  document.getElementById('valveState').textContent = r && r.ok ? `valve=${dir}` : 'valve set failed';
 }
 async function applyPwm(){
   const v = Math.max(0, Math.min(255, +document.getElementById('pwm').value||0));
-  if (v === 0){
-    if (!lastPaused) await fetch('/api/toggle').catch(()=>{});
-    document.getElementById('pwmState').textContent = `pwm=0 → paused`;
-    return;
-  }
-  const pct = Math.max(10, Math.min(100, Math.round((v/255)*100)));
-  await fetch(`/api/power?pct=${pct}`).catch(()=>{});
-  if (lastPaused) await fetch('/api/toggle').catch(()=>{});
-  document.getElementById('pwmState').textContent = `pwm=${v} → powerPct=${pct}`;
+  const headers = {'Content-Type':'application/x-www-form-urlencoded'};
+  const r = await fetch('/api/pwm', {method:'POST', headers, body:new URLSearchParams({duty:String(v)})}).catch(()=>null);
+  document.getElementById('pwmState').textContent = r && r.ok ? `pwm=${v}` : 'pwm set failed';
 }
 async function toggleRun(){ await fetch('/api/toggle').catch(()=>{}); }
 
-/* Capture/fit/list/clear/export */
+/* Capture/fit/list/clear/export (unchanged) */
 async function capture(){
   const ch = document.getElementById('ch').value;
   const actual = document.getElementById('actual').value;
@@ -236,24 +239,42 @@ void web_cal_register_routes(AsyncWebServer& server){
     req->send_P(200, "text/html", CAL_HTML);
   });
 
+  // --- RAW PWM override (calibration) ---
   server.on("/api/pwm", HTTP_POST, [](AsyncWebServerRequest *req){
-    if (!H.setPwmRaw){ req->send(500, "application/json", "{\"ok\":false,\"err\":\"no hook\"}"); return; }
-    int duty = req->getParam("duty", true)->value().toInt();
+    int duty = 0;
+    if (req->hasParam("duty", true)) duty = req->getParam("duty", true)->value().toInt();
+    else if (req->hasParam("duty"))  duty = req->getParam("duty")->value().toInt();
     duty = constrain(duty, 0, 255);
-    H.setPwmRaw((uint8_t)duty);
+
+    // Apply immediately and refresh override window
+    const uint32_t until = millis() + 3000;
+    G.overrideOutputs.store(1, std::memory_order_relaxed);
+    G.overrideUntilMs.store(until, std::memory_order_relaxed);
+
+    io_pwm_write((uint8_t)duty);
+    G.pwm.store((unsigned)duty, std::memory_order_relaxed);
+
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
+  // --- RAW valve override (calibration) ---
   server.on("/api/valve", HTTP_POST, [](AsyncWebServerRequest *req){
-    if (!H.setValveDir){ req->send(500, "application/json", "{\"ok\":false,\"err\":\"no hook\"}"); return; }
     int dir = 0;
     if (req->hasParam("dir", true)) dir = req->getParam("dir", true)->value().toInt();
     else if (req->hasParam("dir"))  dir = req->getParam("dir")->value().toInt();
     dir = (dir > 0) ? 1 : 0;
-    H.setValveDir(dir);
+
+    const uint32_t until = millis() + 3000;
+    G.overrideOutputs.store(1, std::memory_order_relaxed);
+    G.overrideUntilMs.store(until, std::memory_order_relaxed);
+
+    io_valve_write(dir != 0);
+    G.valve.store((unsigned)dir, std::memory_order_relaxed);
+
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
+  // --- Calibration capture/fit/list/clear (unchanged) ---
   server.on("/api/cal/capture", HTTP_POST, [](AsyncWebServerRequest *req){
     String ch;
     if      (req->hasParam("ch", true)) ch = req->getParam("ch", true)->value();

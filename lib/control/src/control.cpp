@@ -12,12 +12,16 @@
   - Runs valve/pump state machine for FWD/REV/BEAT
   - Samples ADC (vent/atr), converts counts→mmHg (local linear fit)
   - Writes atomics: pwm, valve, vent_mmHg, atr_mmHg, loopMs
-  Concurrency: This task is the sole writer of pwm/valve/vent/atr/loop atomics.
+  Concurrency:
+    • Normal: this task writes pwm/valve and hardware pins.
+    • Calibration override active (G.overrideOutputs && now < overrideUntilMs):
+        - Do NOT write hardware pins
+        - Do NOT update G.pwm / G.valve (so SSE/UI retain manual values)
 ===============================================================================
 */
 
-// UNO-derived linear conversion; keep logic identical to original for continuity.
-static inline float countsToMMHg(uint16_t c) { return 0.4766825f * c - 204.409f; } // :contentReference[oaicite:9]{index=9}
+// UNO-derived linear conversion (for continuity with existing UI display).
+static inline float countsToMMHg(uint16_t c) { return 0.4766825f * c - 204.409f; }
 
 enum { MODE_FWD = 0, MODE_REV = 1, MODE_BEAT = 2 };
 static inline int nextMode(int m){ return (m==MODE_FWD)?MODE_REV:(m==MODE_REV)?MODE_BEAT:MODE_FWD; }
@@ -28,7 +32,8 @@ static inline const char* modeName(int m){
 enum Phase { PH_RAMP_UP, PH_HOLD, PH_RAMP_DOWN, PH_DEAD };
 
 static inline int pwmFromPowerPct(int pct){
-  if (pct < 10) pct = 10; if (pct > 100) pct = 100;
+  if (pct < 10) pct = 10;
+  if (pct > 100) pct = 100;
   const float x = pct * (1.0f/100.0f);
   int pwm = (int)roundf(PWM_FLOOR + x * (PWM_MAX - PWM_FLOOR));
   if (pwm < PWM_FLOOR) pwm = PWM_FLOOR;
@@ -95,11 +100,11 @@ static void taskControl(void*) {
   float beat_hold_ms = 0.0f;
   int   lastModeSeen  = G.mode.load();
   int   lastPowerSeen = G.powerPct.load();
-  float lastBpmSeen   = G.bpm.load();
 
   auto recomputeBeatBudget = [&](){
     float bpm = G.bpm.load();
-    if (bpm < 0.5f) bpm = 0.5f; if (bpm > 60.0f) bpm = 60.0f;
+    if (bpm < 0.5f) bpm = 0.5f;
+    if (bpm > 60.0f) bpm = 60.0f;
     const float Th_ms = (60.0f / bpm) * 1000.0f * 0.5f;
 
     const float tUp_ms   = (targetPWM - PWM_FLOOR) / PWM_SLOPE_UP   * 1000.0f;
@@ -200,7 +205,13 @@ static void taskControl(void*) {
     const int  mode   = G.mode.load();
     const int  power  = G.powerPct.load();
 
-    wantForward = (mode != MODE_REV);
+    // Calibration override window check
+    const uint32_t nowMs2 = nowMs;
+    const bool overrideActive =
+      (G.overrideOutputs.load(std::memory_order_relaxed) != 0) &&
+      (nowMs2 < G.overrideUntilMs.load(std::memory_order_relaxed));
+
+    bool  wantForward = (mode != MODE_REV);
 
     if (powerChanged || power != lastPowerSeen) {
       targetPWM = paused ? 0 : pwmFromPowerPct(power);
@@ -222,16 +233,19 @@ static void taskControl(void*) {
 
     if (bpmChanged) {
       if (mode == MODE_BEAT) recomputeBeatBudget();
-      lastBpmSeen = G.bpm.load();
     }
 
     if (paused) {
       pwmCmd = 0.0f;
-      G.pwm.store(0, std::memory_order_relaxed);
-      G.valve.store(0, std::memory_order_relaxed);
+      if (!overrideActive) {
+        G.pwm.store(0, std::memory_order_relaxed);
+        G.valve.store(0, std::memory_order_relaxed);
+      }
     #if ENABLE_OUTPUTS
-      io_pwm_write(0);
-      io_valve_write(false);
+      if (!overrideActive) {
+        io_pwm_write(0);
+        io_valve_write(false);
+      }
     #endif
     } else {
       if (mode == MODE_FWD || mode == MODE_REV) {
@@ -282,12 +296,17 @@ static void taskControl(void*) {
       }
 
       const int outPWM = (int)constrain(lroundf(pwmCmd), 0, PWM_MAX);
-      G.pwm.store((unsigned)outPWM, std::memory_order_relaxed);
-      G.valve.store(dirForward ? 1u : 0u, std::memory_order_relaxed);
+
+      if (!overrideActive) {
+        G.pwm.store((unsigned)outPWM, std::memory_order_relaxed);
+        G.valve.store(dirForward ? 1u : 0u, std::memory_order_relaxed);
+      }
 
     #if ENABLE_OUTPUTS
-      io_valve_write(dirForward);
-      io_pwm_write((uint8_t)outPWM);
+      if (!overrideActive) {
+        io_valve_write(dirForward);
+        io_pwm_write((uint8_t)outPWM);
+      }
     #endif
     }
 
@@ -297,17 +316,15 @@ static void taskControl(void*) {
     G.vent_mmHg.store(countsToMMHg(rVent), std::memory_order_relaxed);
     G.atr_mmHg .store(countsToMMHg(rAtr),  std::memory_order_relaxed);
 
-    // Flow is written by flow task (leave untouched here)
-
     // Status
     if (millis() - lastPrintMs >= STATUS_MS) {
       lastPrintMs = nowMs;
       const float hz = 1000.0f / (loopMsEMA > 0 ? loopMsEMA : 1);
       const char* ph = (phase==PH_RAMP_UP)?"UP":(phase==PH_HOLD)?"HOLD":(phase==PH_RAMP_DOWN)?"DOWN":"DEAD";
-      Serial.printf("[CTRL] Hz=%.1f  paused=%d  mode=%s  dir=%s  phase=%s  pwm=%3u tgt=%3d bpm=%.1f hold=%.0fms\n",
+      Serial.printf("[CTRL] Hz=%.1f paused=%d mode=%s override=%d pwm=%3u tgt=%3d bpm=%.1f hold=%.0fms phase=%s\n",
                     hz, G.paused.load(), modeName(lastModeSeen),
-                    dirForward?"FWD":"REV", ph,
-                    G.pwm.load(), targetPWM, G.bpm.load(), beat_hold_ms);
+                    (int)((G.overrideOutputs.load()!=0) && (millis()<G.overrideUntilMs.load())),
+                    G.pwm.load(), targetPWM, G.bpm.load(), beat_hold_ms, ph);
     }
 
     // 1 Hz heartbeat LED

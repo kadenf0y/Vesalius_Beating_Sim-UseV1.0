@@ -34,7 +34,7 @@ static inline float scale_vent  (float raw) { return raw * CAL_VENT.gain + CAL_V
 //--------------------------- Control loop & PWM -------------------------------
 #define CONTROL_HZ       500    // 500 Hz control loop (2 ms)
 #define PWM_MAX          255    // 8-bit LEDC
-#define PWM_FLOOR        165    // floor to avoid stall (empirical)
+#define PWM_FLOOR        0    // floor to avoid stall (empirical)
 #define PWM_SLOPE_UP     350.0f // PWM counts per second up-ramp
 #define PWM_SLOPE_DOWN   350.0f // PWM counts per second down-ramp
 #define DEADTIME_MS      100    // valve settle time on direction flips
