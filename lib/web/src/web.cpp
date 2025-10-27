@@ -198,17 +198,17 @@ document.querySelectorAll('#modeSeg button').forEach(b=> b.addEventListener('cli
 function adjustPwm(d){ const el=$('pwmIn'); if(!el) return; let v=Number(el.value||0); v = Math.max(0, Math.min(255, v + d)); el.value = v; post('/api/pwm?duty='+v); }
 function adjustBpm(d){ const el=$('bpmIn'); if(!el) return; let v=Number(el.value||0); v = Math.max(1, Math.min(60, v + d)); el.value = v; post('/api/bpm?b='+v); }
 
-// SSE receiver — uses server keys: atr_mmHg, vent_mmHg, flow_L_min, pwm, valve, mode, bpm, loopMs
+// SSE receiver — uses server keys: atr_mmHg, vent_mmHg, flow_L_min, pwmSet, pwm, valve, mode, bpm, loopMs
 const es = new EventSource('/stream'); let last=performance.now(), ema=0;
 es.onopen=()=>$('sse')? $('sse').textContent='OPEN' : null; es.onerror=()=>$('sse')? $('sse').textContent='ERR' : null;
 es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; const fps=1000/Math.max(1,dt); ema= ema? (ema*0.98 + fps*0.02) : fps; if($('fps')) $('fps').textContent=Math.round(ema);
   try{ const d=JSON.parse(ev.data);
-    sAtr.push(Number(d.atr_mmHg)||0); sVent.push(Number(d.vent_mmHg)||0); sFlow.push(Number(d.flow_L_min)||0);
-    sValve.push(d.valve?1:0); sPwm.push(Number(d.pwm)||0);
+  sAtr.push(Number(d.atr_mmHg)||0); sVent.push(Number(d.vent_mmHg)||0); sFlow.push(Number(d.flow_L_min)||0);
+  sValve.push(d.valve?1:0); sPwm.push(Number(d.pwm)||0);
     setNum('n-atr', d.atr_mmHg, 1); setNum('n-vent', d.vent_mmHg, 1); setNum('n-flow', d.flow_L_min, 2); setNum('n-pwm', d.pwm,0);
     if($('n-valve')) $('n-valve').textContent = d.valve? '▲' : '▼';
     document.querySelectorAll('#modeSeg button').forEach(b=> b.classList.toggle('active', Number(b.dataset.m)===Number(d.mode||0)));
-    if($('pwmIn')) $('pwmIn').value = d.pwm||0; if($('bpmIn')) $('bpmIn').value = d.bpm||0; if(d.loopMs && $('loop')) $('loop').textContent = Number(d.loopMs).toFixed(2)+' ms';
+  if($('pwmIn')) $('pwmIn').value = d.pwmSet||0; if($('bpmIn')) $('bpmIn').value = d.bpm||0; if(d.loopMs && $('loop')) $('loop').textContent = Number(d.loopMs).toFixed(2)+' ms';
     if($('btnToggle')){
       const b=$('btnToggle'); if(Number(d.paused||0)===0){ b.textContent='Pause'; b.classList.remove('btn-play'); b.classList.add('btn-pause'); } else { b.textContent='Play'; b.classList.remove('btn-pause'); b.classList.add('btn-play'); }
     }
@@ -220,6 +220,45 @@ window.addEventListener('load', ()=>{ sAtr.render(); sVent.render(); sFlow.rende
 </body></html>
 )HTML";
 
+// Small helper page to view the raw SSE stream with two modes:
+// - Auto-scroll down (newest at bottom)
+// - Newest-on-top (prepend messages)
+static const char STREAM_VIEW_HTML[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream Viewer</title>
+<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b0f13;color:#e6edf3;margin:0;padding:8px} .bar{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+button{padding:6px 8px;border-radius:6px;border:1px solid #26303a;background:#0f1317;color:#e6edf3}
+#log{height:75vh;overflow:auto;border:1px solid #26303a;padding:8px;border-radius:6px;background:#071018;font-family:monospace;font-size:12px}
+.entry{padding:6px;border-radius:6px;margin-bottom:6px;background:rgba(255,255,255,0.02);word-break:break-all}
+</style>
+</head><body>
+  <div class="bar">
+    <label style="font-size:13px">Mode:</label>
+    <select id="mode"><option value="bottom">Auto-scroll bottom (newest at bottom)</option><option value="top">Newest on top (prepend)</option></select>
+    <button id="clear">Clear</button>
+    <div style="flex:1"></div>
+    <div id="status">SSE: connecting...</div>
+  </div>
+  <div id="log"></div>
+
+<script>
+const log = document.getElementById('log'); const modeEl = document.getElementById('mode'); const status = document.getElementById('status');
+const es = new EventSource('/stream');
+es.onopen = ()=> status.textContent = 'SSE: open';
+es.onerror = ()=> status.textContent = 'SSE: error';
+es.onmessage = (ev)=>{ try{ const txt = ev.data; const el = document.createElement('div'); el.className='entry'; el.textContent = new Date().toLocaleTimeString() + '  ' + txt; if(modeEl.value==='top'){ log.insertBefore(el, log.firstChild); } else { log.appendChild(el); }
+    // keep size reasonable
+    while(log.children.length>500) { if(modeEl.value==='top') log.removeChild(log.lastChild); else log.removeChild(log.firstChild); }
+    if(modeEl.value==='bottom'){ // auto-scroll to bottom
+      log.scrollTop = log.scrollHeight;
+    }
+  }catch(e){}
+};
+document.getElementById('clear').addEventListener('click', ()=> log.innerHTML='');
+</script>
+</body></html>
+)HTML";
+
 // ---- SSE task @ 60 Hz on Core 0 ----
 static void sse_task(void*){
   const TickType_t per = pdMS_TO_TICKS(1000/SSE_HZ);
@@ -227,24 +266,25 @@ static void sse_task(void*){
   static char buf[512];
   for(;;){
     int mode  = G.mode.load();
-    int paused= G.paused.load(); if (paused==2) paused=1; // present "pending" as paused
-    int pwm   = G.pwmSet.load();
-    int valve = G.valve.load();
-    int bpm   = G.bpm.load();
-    float atr = G.atr_mmHg.load();
-    float ven = G.vent_mmHg.load();
-    float fl  = G.flow_L_min.load();
-    float loop= G.loopMs.load();
+      int paused= G.paused.load(); if (paused==2) paused=1; // present "pending" as paused
+      int pwmSet= G.pwmSet.load();
+      int pwm   = G.pwmOut.load();
+      int valve = G.valve.load();
+      int bpm   = G.bpm.load();
+      float atr = G.atr_mmHg.load();
+      float ven = G.vent_mmHg.load();
+      float fl  = G.flow_L_min.load();
+      float loop= G.loopMs.load();
 
-    int n = snprintf(buf, sizeof(buf),
-      "{\"mode\":%d,\"paused\":%d,\"pwm\":%d,\"valve\":%d,\"bpm\":%d,\"loopMs\":%.3f,"
-      "\"atr_mmHg\":%.3f,\"vent_mmHg\":%.3f,\"flow_L_min\":%.3f,"
-      "\"atr_raw\":%d,\"vent_raw\":%d,\"flow_hz\":%.3f,"
-      "\"cal\":{\"atr_m\":%.6f,\"atr_b\":%.6f,\"vent_m\":%.6f,\"vent_b\":%.6f,\"flow_m\":%.6f,\"flow_b\":%.6f}}",
-      mode, paused, pwm, valve, bpm, loop,
-      atr, ven, fl,
-      G.atr_raw.load(), G.vent_raw.load(), G.flow_hz.load(),
-      G.atr_m.load(), G.atr_b.load(), G.vent_m.load(), G.vent_b.load(), G.flow_m.load(), G.flow_b.load());
+      int n = snprintf(buf, sizeof(buf),
+        "{\"mode\":%d,\"paused\":%d,\"pwmSet\":%d,\"pwm\":%d,\"valve\":%d,\"bpm\":%d,\"loopMs\":%.3f,"
+        "\"atr_mmHg\":%.3f,\"vent_mmHg\":%.3f,\"flow_L_min\":%.3f,"
+        "\"atr_raw\":%d,\"vent_raw\":%d,\"flow_hz\":%.3f,"
+        "\"cal\":{\"atr_m\":%.6f,\"atr_b\":%.6f,\"vent_m\":%.6f,\"vent_b\":%.6f,\"flow_m\":%.6f,\"flow_b\":%.6f}}",
+        mode, paused, pwmSet, pwm, valve, bpm, loop,
+        atr, ven, fl,
+        G.atr_raw.load(), G.vent_raw.load(), G.flow_hz.load(),
+        G.atr_m.load(), G.atr_b.load(), G.vent_m.load(), G.vent_b.load(), G.flow_m.load(), G.flow_b.load());
     if (n>0) sse.send(buf, "message", millis());
     vTaskDelayUntil(&wake, per);
   }
@@ -303,7 +343,7 @@ static void nvs_defaults_all(){
 static int  read_atr_raw(){ return G.atr_raw.load(); }
 static int  read_vent_raw(){ return G.vent_raw.load(); }
 static float read_flow_hz(){ return G.flow_hz.load(); }
-static void write_pwm_raw(uint8_t d){ G.pwmSet.store(d); G.overrideOutputs.store(1); G.overrideUntilMs.store(millis()+3000); io_write_pwm(d); }
+static void write_pwm_raw(uint8_t d){ G.pwmSet.store(d); G.pwmOut.store(d); G.overrideOutputs.store(1); G.overrideUntilMs.store(millis()+3000); io_write_pwm(d); }
 static void write_valve_raw(uint8_t v){ v=v?1:0; G.valve.store(v); G.overrideOutputs.store(1); G.overrideUntilMs.store(millis()+3000); io_write_valve(v); }
 
 void web_start(){
@@ -344,6 +384,9 @@ void web_start(){
   // SSE
   sse.onConnect([](AsyncEventSourceClient* c){ c->send(": ok\n\n"); });
   server.addHandler(&sse);
+
+  // Stream viewer page - does not replace /stream (SSE) but provides a friendly UI at /stream/view
+  server.on("/stream/view", HTTP_GET, [](AsyncWebServerRequest* r){ r->send_P(200, "text/html", STREAM_VIEW_HTML); });
 
   // Calibration sub-router
   CalHooks hooks{

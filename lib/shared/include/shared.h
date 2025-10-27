@@ -19,6 +19,7 @@ struct Shared {
   std::atomic<int>   mode{MODE_FWD};        // 0=FWD,1=REV,2=BEAT  (Core0 write via cmd → Core1 consumes)
   std::atomic<int>   paused{1};             // 0/1               (Core0 cmd / buttons on Core1)
   std::atomic<int>   pwmSet{0};             // 0..255 setpoint (Core0 cmd / buttons; Core1 ramps to this)
+  std::atomic<int>   pwmOut{0};             // 0..255 actual hardware PWM (Core1 writes)
   std::atomic<int>   valve{VALVE_FWD};      // 0/1 current direction (Core1 writes; also raw override updates)
   std::atomic<int>   bpm{30};               // [1..60]           (Core0 cmd)
 

@@ -39,201 +39,240 @@ static void control_task(void* /*arg*/){
   pinMode(PIN_STATUS_LED, OUTPUT);
 
   // local state
-  uint8_t pwm_out = 0;
-  uint8_t pwm_set = 0;         // desired setpoint (G.pwmSet)
-  uint8_t valve_dir = VALVE_FWD;
+  uint8_t pwm_out = 0;                   // current hardware PWM
+  float pwm_out_f = 0.0f;               // fractional accumulator for smooth ramping
+  uint8_t pwm_set = 0;                   // desired setpoint (snapshot of G.pwmSet)
+  uint8_t valve_dir = VALVE_FWD;         // current hardware valve
 
-  // Beat timing
-  uint32_t phaseStartMs = millis();
-  enum Phase { PH_RAMP_UP, PH_HOLD, PH_RAMP_DOWN, PH_DEAD } phase = PH_RAMP_UP;
-
-  // helper: compute half-period & hold based on BPM and fixed ramps/deadtime
-  auto compute_hold_ms = [&]()->uint32_t{
+  // Beat timing helpers
+  auto compute_half_hold_ms = [&]()->uint32_t{
     int bpm = G.bpm.load(); if (bpm<1) bpm=1; if (bpm>60) bpm=60;
     uint32_t half_ms = (uint32_t)(60000.0f/(2.0f*bpm));
+    // used = ramp_up + dead + ramp_down
     uint32_t used = RAMP_MS + DEAD_MS + RAMP_MS;
     return (half_ms>used)? (half_ms-used) : 0u;
   };
-  uint32_t beatHoldMs = compute_hold_ms();
 
-  // loop timing EMA
+  // timing
   float loopEmaMs = 1000.0f/CONTROL_HZ;
   uint32_t lastUs = micros();
-
-  // button handling
-  BtnState bs{};
-  uint32_t bPressMs=0; bool bLongFired=false;
-
-  // ADC smoothing rings
-  MA atr_ma{}, vent_ma{};
-
-  // Task timing
   const TickType_t period = pdMS_TO_TICKS(1000/CONTROL_HZ);
   TickType_t wake = xTaskGetTickCount();
 
+  // Buttons
+  BtnState bs{};
+  uint32_t aRiseTs = 0, bRiseTs = 0;          // rise timestamps for chord detection
+  uint32_t bPressMs = 0; bool bLongFired = false;
+  static constexpr uint32_t CHORD_TOL_MS = 80; // tolerance for near-simultaneous A+B
+  static uint8_t chord_gated = 0;
+
+  // Sequencers
+  uint8_t seq = 0;           // direction change seq: 0=idle,1=down,2=dead,3=flip,4=up
+  uint32_t seqT = 0;
+
+  // Beat substate
+  uint8_t bstate = 0;        // 0=up,1=hold,2=down,3=dead1,4=dead2
+  uint32_t bstateT = 0;
+  uint32_t beatHoldMs = compute_half_hold_ms();
+
+  // previous paused for edge detection
+  uint8_t prevPaused = (uint8_t)G.paused.load();
+
+  // helper lambdas
+  auto setValveIfChanged = [&](uint8_t d){
+    if (valve_dir != d){ valve_dir = d; io_write_valve(valve_dir); }
+  };
+  auto setPwmIfChanged = [&](uint8_t d){
+    if (pwm_out != d){ pwm_out = d; pwm_out_f = (float)pwm_out; io_write_pwm(pwm_out); }
+  };
+  // rampToward: move pwm_out toward target in RAMP_MS across CONTROL_HZ ticks
+  auto rampToward = [&](uint8_t target, bool allowRampUp=true){
+    if (pwm_out == target) return;
+    if (!allowRampUp && target > pwm_out) return; // don't ramp up when disallowed
+    float ticks = (float)RAMP_MS / (1000.0f/CONTROL_HZ);
+    if (ticks < 1.0f) ticks = 1.0f;
+    // compute fractional step using the fractional accumulator so small steps accumulate over ticks
+    float step = ((float)target - pwm_out_f) / ticks;
+    pwm_out_f += step;
+    // clamp accumulator to target to avoid overshoot
+    if (step > 0.0f && pwm_out_f > (float)target) pwm_out_f = (float)target;
+    if (step < 0.0f && pwm_out_f < (float)target) pwm_out_f = (float)target;
+    int next = (int)roundf(pwm_out_f);
+    if ((step>0 && next>target) || (step<0 && next<target)) next = target;
+    pwm_out = clamp8(next);
+    io_write_pwm(pwm_out);
+  };
+  auto forceOutputsOff = [&](){ pwm_out = 0; io_write_pwm(0); valve_dir = VALVE_FWD; io_write_valve(valve_dir); };
+
   for(;;){
-    // --- loop timing
+    // timing
     uint32_t nowUs = micros();
-    float dtMs = (nowUs-lastUs)*0.001f; lastUs=nowUs;
+    float dtMs = (nowUs-lastUs)*0.001f; lastUs = nowUs;
     loopEmaMs = loopEmaMs*0.9f + dtMs*0.1f;
     G.loopMs.store(loopEmaMs, std::memory_order_relaxed);
 
-    // --- consume commands
+    // consume commands
     Cmd cmd;
     while (shared_cmdq() && xQueueReceive(shared_cmdq(), &cmd, 0) == pdTRUE){
-      if (cmd.t==CMD_TOGGLE){
-        // Pause only allowed when pwm==0 → if running, ramp to 0 then pause.
+      if (cmd.t == CMD_TOGGLE){
         int paused = G.paused.load();
-        if (paused){ G.paused.store(0); phase = PH_RAMP_UP; phaseStartMs=millis(); }
-        else{
-          // request: ramp down to zero then pause (handled below)
-          G.paused.store(2); // 2 = "pending pause after ramp-down"
-        }
-      } else if (cmd.t==CMD_SET_PWM){
-        int v = cmd.i; if(v<0)v=0; if(v>255)v=255;
-        G.pwmSet.store(v);
-      } else if (cmd.t==CMD_SET_BPM){
-        int b = cmd.i; if(b<1)b=1; if(b>60)b=60;
-        G.bpm.store(b); beatHoldMs = compute_hold_ms();
-      } else if (cmd.t==CMD_SET_MODE){
-        int m = cmd.i; if(m<MODE_FWD||m>MODE_BEAT)m=MODE_FWD;
-        G.mode.store(m);
-        // reset phase on mode change
-        phase = PH_RAMP_UP; phaseStartMs=millis();
-      }
-    }
-
-    // --- buttons
-    buttons_read(bs);
-    // A: Play/Pause
-    if (bs.aRise){
-      Cmd c{CMD_TOGGLE,0}; shared_post(c);
-    }
-    // B: short (+5 wrap), long single fire (−5 wrap)
-    if (bs.bRise){ bPressMs=millis(); bLongFired=false; }
-    if (bs.bPressed && !bLongFired && (millis()-bPressMs)>=600){
-      int p = G.pwmSet.load(); p -= 5; if (p<0) p=255; G.pwmSet.store(p); bLongFired=true;
-    }
-    if (bs.bFall && !bLongFired){
-      int p = G.pwmSet.load(); p += 5; if (p>255) p=0; G.pwmSet.store(p);
-    }
-    // A+B chord: cycle mode
-    if (bs.aPressed && bs.bPressed){
-      static uint8_t gated=0;
-      if (!gated){ gated=1; int m=G.mode.load(); m=(m==MODE_BEAT)?MODE_FWD:(m+1); G.mode.store(m); phase=PH_RAMP_UP; phaseStartMs=millis(); }
-    }else{
-      // release the gate when chord breaks
-      static uint8_t& gated = *([]()->uint8_t*{ static uint8_t x=0; return &x; })();
-      gated = 0;
-    }
-
-    // --- outputs sequencing (if not overridden)
-    pwm_set   = (uint8_t)G.pwmSet.load();
-    uint8_t need_dir = (G.mode.load()==MODE_REV)? VALVE_REV : VALVE_FWD;
-
-    bool canWrite = !override_active();
-    if (!canWrite){
-      // Respect override: do not change outputs (also do not alter pwm_out/valve_dir state vars)
-    }else{
-      // Apply Play/Pause rule:
-      int paused = G.paused.load(); // 0=run, 1=paused, 2=pending-pause
-      if (paused==1){
-        pwm_out = 0; io_write_pwm(0); io_write_valve(VALVE_FWD);
-      }else{
-        // immediate PWM setpoint changes ramp to new set (150 ms)
-        // Compute per-tick step for 150 ms to move from current to target:
-        auto rampToward = [&](uint8_t target){
-          if (pwm_out==target) return;
-          // step per tick = (target - pwm_out) / (RAMP_MS / (1000/CONTROL_HZ))
-          float ticks = (float)RAMP_MS / (1000.0f/CONTROL_HZ);
-          float step = (target - (int)pwm_out) / (ticks>1?ticks:1);
-          int next = (int)roundf((float)pwm_out + step);
-          if ((step>0 && next>target) || (step<0 && next<target)) next=target;
-          pwm_out = clamp8(next);
-        };
-
-        // Direction change sequence (FWD↔REV):
-        // ramp set→0 (150 ms) → dead 100 ms → flip valve → ramp 0→set (150 ms)
-        static uint8_t seq=0; // 0=idle,1=down,2=dead,3=flip,4=up
-        static uint32_t seqT=0;
-
-        if (valve_dir != need_dir && seq==0){ seq=1; seqT=millis(); } // start sequence
-
-        if (seq==1){
-          rampToward(0);
-          if (millis()-seqT >= RAMP_MS){ seq=2; seqT=millis(); }
-        } else if (seq==2){
-          if (millis()-seqT >= DEAD_MS){ seq=3; }
-        } else if (seq==3){
-          valve_dir = need_dir;
-          io_write_valve(valve_dir);
-          seq=4;
-        } else if (seq==4){
-          rampToward(pwm_set);
-          if (pwm_out==pwm_set){ seq=0; }
+        if (paused){
+          // unpause -> immediate valve direction set and begin ramp up
+          G.paused.store(0);
+          // valve and ramp-up handled below on running path using need_dir/pwm_set
         } else {
-          // regular operation (no direction change)
-          if (G.mode.load()==MODE_BEAT){
-            // Beat: the above fixed sequence always runs; remaining time is hold
-            static uint8_t bstate=0; // 0=up,1=hold,2=down,3=dead
-            if (bstate==0){
-              rampToward(pwm_set);
-              if (pwm_out==pwm_set){ bstate=1; seqT=millis(); }
-            }else if (bstate==1){
-              if (millis()-seqT >= beatHoldMs){ bstate=2; }
-            }else if (bstate==2){
-              rampToward(0);
-              if (pwm_out==0){ bstate=3; seqT=millis(); }
-            }else if (bstate==3){
-              if (millis()-seqT >= DEAD_MS){
-                valve_dir = (valve_dir==VALVE_FWD)?VALVE_REV:VALVE_FWD;
-                io_write_valve(valve_dir);
-                bstate=0;
-              }
-            }
-          }else{
-            // FWD or REV steady: ensure correct direction and ramp to set
-            valve_dir = need_dir;
-            io_write_valve(valve_dir);
-            rampToward(pwm_set);
-          }
+          // request pending pause: finish ramp to zero then set paused
+          G.paused.store(2);
         }
-
-        // Enforce pause pending: if pending, finish ramp to 0 then pause
-        if (paused==2){
-          if (pwm_out>0) {
-            // keep ramping toward zero
-            int next = (int)pwm_out - (int)roundf(255.0f / (RAMP_MS/(1000.0f/CONTROL_HZ)));
-            pwm_out = clamp8(next);
+      } else if (cmd.t == CMD_SET_PWM){
+        int v = cmd.i; if (v<0) v=0; if (v>255) v=255; G.pwmSet.store(v);
+      } else if (cmd.t == CMD_SET_BPM){
+        int b = cmd.i; if (b<1) b=1; if (b>60) b=60; G.bpm.store(b); beatHoldMs = compute_half_hold_ms();
+      } else if (cmd.t == CMD_SET_MODE){
+        int m = cmd.i; if (m<MODE_FWD||m>MODE_BEAT) m = MODE_FWD;
+        // do not auto-unpause on mode change; just update mode
+        G.mode.store(m);
+        // recompute beat budget if needed
+        if (m==MODE_BEAT) {
+          beatHoldMs = compute_half_hold_ms();
+          // reset beat substate so beat starts cleanly when running
+          bstate = 0; bstateT = millis();
+        }
+        // if running, start direction-change sequence (or start beat immediately)
+        if (G.paused.load()==0){
+          if (m==MODE_BEAT){
+            // ensure beat starts from a ramp-up
+            bstate = 0; bstateT = millis();
           } else {
-            G.paused.store(1); // now paused
+            // start seq to change valve safely for FWD<->REV
+            seq = 1; seqT = millis();
           }
         }
-
-        io_write_pwm(pwm_out);
       }
     }
 
-    // publish current outputs (even if overridden, we publish last internal values)
-    G.valve.store(valve_dir);
-    G.pwmSet.store(pwm_set);
+    // buttons
+    buttons_read(bs);
+    if (bs.aRise) aRiseTs = millis();
+    if (bs.bRise) bRiseTs = millis();
 
-    // --- ADC read + smoothing + calibration
-    int atr_r  = io_read_atr();
-    int vent_r = io_read_vent();
+    bool chord_now = false;
+    if (bs.aPressed && bs.bPressed){
+      if (!chord_gated){
+        if (aRiseTs && bRiseTs && (abs((int32_t)aRiseTs - (int32_t)bRiseTs) <= (int32_t)CHORD_TOL_MS)) chord_now = true;
+        else if (aRiseTs==0 && bRiseTs==0) chord_now = true;
+      }
+    }
+    if (chord_now && !chord_gated){
+      chord_gated = 1;
+      int m = G.mode.load(); m = (m==MODE_BEAT)?MODE_FWD:(m+1); G.mode.store(m);
+      if (G.paused.load()==0){ seq = 1; seqT = millis(); }
+    }
+    if (!bs.aPressed || !bs.bPressed) {
+      chord_gated = 0;
+      if (bs.aRise){ Cmd c{CMD_TOGGLE,0}; shared_post(c); }
+      if (bs.bRise){ bPressMs = millis(); bLongFired=false; }
+      if (bs.bPressed && !bLongFired && (millis()-bPressMs)>=600){ int p = G.pwmSet.load(); p -= 5; if (p<0) p=255; G.pwmSet.store(p); bLongFired=true; }
+      if (bs.bFall && !bLongFired){ int p = G.pwmSet.load(); p += 5; if (p>255) p=0; G.pwmSet.store(p); }
+    }
+
+    // outputs
+    pwm_set = (uint8_t)G.pwmSet.load();
+    uint8_t need_dir = (G.mode.load()==MODE_REV)?VALVE_REV:VALVE_FWD;
+
+    bool isOverride = override_active();
+    int paused = G.paused.load(); // 0=run,1=paused,2=pending
+
+    // override gate: still enforce safety (pause) writes
+    if (isOverride){
+      if (paused==1 || paused==2) {
+        forceOutputsOff();
+      }
+      // otherwise do not write outputs while override active
+    } else {
+      // normal operation allowed to write outputs
+      // handle pending pause
+      if (paused==2){
+        // finish ramping to zero
+        if (pwm_out>0){
+          // decrement per-tick roughly
+          int next = (int)pwm_out - (int)roundf(255.0f / (RAMP_MS/(1000.0f/CONTROL_HZ)));
+          pwm_out = clamp8(next);
+          io_write_pwm(pwm_out);
+        } else {
+          // reached zero: mark paused and force valve off
+          G.paused.store(1);
+          forceOutputsOff();
+        }
+      } else if (paused==1){
+        // paused: enforce PWM=0 and valve=FWD
+        forceOutputsOff();
+      } else {
+        // running
+        // if user just unpaused (edge), ensure valve immediately set to need_dir
+        if (prevPaused==1 && paused==0){ setValveIfChanged(need_dir); }
+
+        if (seq != 0){
+          // direction change seq: ramp down -> dead -> flip -> ramp up
+          if (seq==1){ // ramp down
+            rampToward(0, true);
+            if (pwm_out==0 && (millis()-seqT)>=0){ seq=2; seqT=millis(); }
+          } else if (seq==2){ // dead wait
+            if (millis()-seqT >= DEAD_MS){ seq=3; }
+          } else if (seq==3){ // flip
+            setValveIfChanged(need_dir);
+            seq = 4; seqT = millis();
+          } else if (seq==4){ // ramp up
+            rampToward(pwm_set, true);
+            if (pwm_out==pwm_set) seq = 0;
+          }
+        } else if (G.mode.load()==MODE_BEAT){
+          // beat mode state machine (per half-period)
+          if (bstate==0){ // ramp up
+            rampToward(pwm_set, true);
+            if (pwm_out==pwm_set){ bstate=1; bstateT=millis(); }
+          } else if (bstate==1){ // hold
+            if (millis()-bstateT >= beatHoldMs){ bstate=2; }
+          } else if (bstate==2){ // ramp down
+            rampToward(0, true);
+            if (pwm_out==0){ bstate=3; bstateT=millis(); }
+          } else if (bstate==3){ // dead half 1
+            if (millis()-bstateT >= (DEAD_MS/2)){ // flip in middle
+              // use helper so writes and local state are consistent
+              setValveIfChanged((valve_dir==VALVE_FWD)?VALVE_REV:VALVE_FWD);
+              bstate = 4; bstateT = millis();
+            }
+          } else if (bstate==4){ // dead half 2
+            if (millis()-bstateT >= (DEAD_MS/2)){ bstate = 0; }
+          }
+        } else {
+          // steady FWD or REV
+          setValveIfChanged(need_dir);
+          rampToward(pwm_set, true);
+        }
+      }
+    }
+
+  // publish: expose both setpoint and actual hardware PWM
+  G.valve.store(valve_dir);
+  G.pwmSet.store(pwm_set);
+  G.pwmOut.store(pwm_out);
+
+    // ADC + smoothing
+    int atr_r = io_read_atr(); int vent_r = io_read_vent();
     G.atr_raw.store(atr_r); G.vent_raw.store(vent_r);
-    atr_ma.push((float)atr_r);
-    vent_ma.push((float)vent_r);
-
-    float atr_cal  = apply_cal(atr_ma.mean(),  G.atr_m.load(),  G.atr_b.load());
+    // push smoothing (reuse MA local instances)
+    static MA atr_ma{}, vent_ma{}; atr_ma.push((float)atr_r); vent_ma.push((float)vent_r);
+    float atr_cal = apply_cal(atr_ma.mean(), G.atr_m.load(), G.atr_b.load());
     float vent_cal = apply_cal(vent_ma.mean(), G.vent_m.load(), G.vent_b.load());
-    G.atr_mmHg.store(atr_cal);
-    G.vent_mmHg.store(vent_cal);
+    G.atr_mmHg.store(atr_cal); G.vent_mmHg.store(vent_cal);
 
-    // heartbeat LED ~ 1 Hz
-    static uint32_t ledT=0; static bool led=0;
-    if (millis()-ledT >= 500){ ledT=millis(); led=!led; digitalWrite(PIN_STATUS_LED, led); }
+    // heartbeat LED ~1Hz
+    static uint32_t ledT=0; static bool led=false;
+    if (millis()-ledT >= 500){ ledT = millis(); led = !led; digitalWrite(PIN_STATUS_LED, led); }
 
+    // update prevPaused and delay
+    prevPaused = (uint8_t)G.paused.load();
     vTaskDelayUntil(&wake, period);
   }
 }
