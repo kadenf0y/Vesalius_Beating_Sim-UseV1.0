@@ -1,3 +1,7 @@
 #pragma once
-// Start the control task (500 Hz) pinned to CONTROL_CORE
-void control_start_task();
+#include <Arduino.h>
+
+/* ==========================================================================================
+   control.h — Real-time 600 Hz control loop on Core 1
+   ==========================================================================================*/
+void control_start();

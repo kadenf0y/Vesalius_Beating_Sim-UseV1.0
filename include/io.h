@@ -1,16 +1,20 @@
 #pragma once
 #include <Arduino.h>
+#include "app_config.h"
 
-/*
-===============================================================================
-  IO: Thin hardware accessors (ADC config, PWM, valve pin)
-===============================================================================
-*/
+/* ==========================================================================================
+   io.h — Thin, well-commented hardware IO wrappers
+   Ownership:
+     • All functions are USED from Core 1 (control).
+     • Web (/cal raw) writes may bypass via override gate but still call these.
+   ==========================================================================================*/
 
-void     io_init();
+void io_begin();
 
-uint16_t io_adc_read_vent();      // raw 12-bit counts
-uint16_t io_adc_read_atr();
+// ADC raw (12-bit). Fast, non-blocking.
+uint16_t io_read_atr();     // atrium raw counts
+uint16_t io_read_vent();    // ventricle raw counts
 
-void     io_valve_write(bool forward); // true=forward, false=reverse
-void     io_pwm_write(uint8_t pwm);    // 0..255
+// Actuators (respect raw values)
+void io_write_valve(uint8_t dir01); // 0=FWD (LOW), 1=REV (HIGH)
+void io_write_pwm(uint8_t duty);    // 0..255 (LEDC @ 6 kHz)

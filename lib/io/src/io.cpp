@@ -1,33 +1,30 @@
+#include <esp32-hal-ledc.h>
+#include <esp32-hal-adc.h>
 #include "io.h"
-#include "app_config.h"
-#include <esp32-hal-adc.h>  // analogSetPinAttenuation
 
-// LEDC channel/timer (keep stable across modules)
-static const int LEDC_CH    = 0;
-static const int LEDC_TIMER = 0;
-
-void io_init() {
-  // Valve default low
+void io_begin(){
+  // Valve
   pinMode(PIN_VALVE, OUTPUT);
-  digitalWrite(PIN_VALVE, LOW);
+  digitalWrite(PIN_VALVE, VALVE_FWD);
 
-  // PWM @ 20 kHz, 8-bit
-  ledcSetup(LEDC_CH, 20000, 8);
-  ledcAttachPin(PIN_PUMP_PWM, LEDC_CH);
-  ledcWrite(LEDC_CH, 0);
+  // Pump PWM on LEDC
+  ledcSetup(PUMP_LEDC_CH, PUMP_PWM_FREQ_HZ, PUMP_PWM_BITS);
+  ledcAttachPin(PIN_PUMP_PWM, PUMP_LEDC_CH);
+  ledcWrite(PUMP_LEDC_CH, 0);
 
-  // ADC config — ADC1 pins so Wi-Fi coexistence is fine
-  analogReadResolution(12);
+  // ADC
+  analogReadResolution(ADC_BITS);
+  pinMode(PIN_PRESS_ATR, INPUT);
   pinMode(PIN_PRESS_VENT, INPUT);
-  pinMode(PIN_PRESS_ATR,  INPUT);
-  analogSetPinAttenuation(PIN_PRESS_VENT, ADC_0db);
-  analogSetPinAttenuation(PIN_PRESS_ATR,  ADC_0db);
+  analogSetPinAttenuation(PIN_PRESS_ATR,  PRESS_ATTEN);
+  analogSetPinAttenuation(PIN_PRESS_VENT, PRESS_ATTEN);
 
-  // Flow pin (external pull/level; no internal pullup)
-  pinMode(PIN_FLOW, INPUT);
+  // Flow input
+  pinMode(PIN_FLOW, FLOW_INPUT_PULLUP ? INPUT_PULLUP : INPUT);
 }
 
-uint16_t io_adc_read_vent() { return analogRead(PIN_PRESS_VENT); }
-uint16_t io_adc_read_atr()  { return analogRead(PIN_PRESS_ATR);  }
-void     io_valve_write(bool fwd){ digitalWrite(PIN_VALVE, fwd ? HIGH : LOW); }
-void     io_pwm_write(uint8_t pwm){ ledcWrite(LEDC_CH, pwm); }
+uint16_t io_read_atr(){  return analogRead(PIN_PRESS_ATR);  }
+uint16_t io_read_vent(){ return analogRead(PIN_PRESS_VENT); }
+
+void io_write_valve(uint8_t dir01){ digitalWrite(PIN_VALVE, dir01 ? HIGH : LOW); }
+void io_write_pwm(uint8_t duty){    ledcWrite(PUMP_LEDC_CH, duty); }

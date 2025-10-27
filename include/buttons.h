@@ -2,22 +2,20 @@
 #include <Arduino.h>
 #include "app_config.h"
 
-/*
-===============================================================================
-  Buttons: two active-LOW momentary inputs with debounce + edge flags
-===============================================================================
-*/
-
-void buttons_init();
+/* ==========================================================================================
+   buttons.h — Debounced buttons on GPIO 14 (A) and 13 (B)
+   Ownership:
+     • Read on Core 1 (control loop).
+     • Exposes debounced state and edges; implements short/long press logic in control.cpp.
+   Wiring:
+     • Buttons short to GND (active-LOW). Internal pull-ups enabled.
+   ==========================================================================================*/
 
 struct BtnState {
-  bool aPressed{};
-  bool bPressed{};
-  bool aPressEdge{};
-  bool aReleaseEdge{};
-  bool bPressEdge{};
-  bool bReleaseEdge{};
+  bool aPressed=false, bPressed=false;
+  bool aRise=false, aFall=false;
+  bool bRise=false, bFall=false;
 };
 
-void buttons_read_debounced(BtnState& out);
-void buttons_debug_print();
+void buttons_init();
+void buttons_read(BtnState& out); // call at 600 Hz

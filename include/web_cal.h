@@ -2,25 +2,29 @@
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
 
-/*
-===============================================================================
-  Web Calibration routes and tiny in-memory dataset
+/* ==========================================================================================
+   web_cal.h — Calibration UI endpoints (mounted by web.cpp)
+   Notes:
+     • This module is UI-level only. It *calls back* into lambdas provided by web.cpp
+       so we don’t depend on control internals here.
+   ==========================================================================================*/
 
-  Hooks remain for reading raw averages; manual override for PWM/valve is now
-  implemented directly by /api/pwm and /api/valve in web_cal.cpp, which:
-    - Apply raw hardware writes immediately (PWM 0..255, valve 0/1)
-    - Set G.overrideOutputs=1 and refresh G.overrideUntilMs=now+3000ms so the
-      control loop does not fight manual settings during calibration.
-===============================================================================
-*/
+struct CalHooks {
+  // Raw one-shot reads (immediate snapshots)
+  int   (*read_atr_raw)();       // returns ADC counts
+  int   (*read_vent_raw)();      // returns ADC counts
+  float (*read_flow_hz)();       // returns Hz estimate
 
-struct WebCalHooks {
-  float (*readAtrRawOnce)();
-  float (*readVentRawOnce)();
-  int   (*getValveDir)();              // -1, 0, +1 (unused here; kept for compatibility)
-  void  (*setValveDir)(int dir);       // negative=REV/0, positive=FWD/1 (unused; kept)
-  void  (*setPwmRaw)(uint8_t pwm);     // 0..255 (unused; kept)
+  // Raw output control (immediate)
+  void  (*write_pwm_raw)(uint8_t duty);    // ALSO sets override gate (now+3s)
+  void  (*write_valve_raw)(uint8_t dir01); // 0/1 (sets override gate)
+
+  // Access to current calibration coefficients (get/set runtime; save/load)
+  void  (*get_cals)(float& am,float& ab,float& vm,float& vb,float& fm,float& fb);
+  void  (*set_cals)(float  am,float  ab,float  vm,float  vb,float  fm,float  fb);
+  bool  (*nvs_save)(bool atr,bool vent,bool flow);
+  bool  (*nvs_load)();
+  void  (*nvs_defaults)();
 };
 
-void web_cal_set_hooks(const WebCalHooks& hooks);
-void web_cal_register_routes(AsyncWebServer& server);
+void web_cal_register(AsyncWebServer& srv, const CalHooks& hooks);

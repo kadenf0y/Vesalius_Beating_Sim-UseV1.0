@@ -1,3 +1,7 @@
 #pragma once
-// Start Wi-Fi AP + HTTP server + SSE streamer (Core 0)
+#include <Arduino.h>
+
+/* ==========================================================================================
+   web.h — Core 0 Web stack (SoftAP + HTTP + SSE + UIs)
+   ==========================================================================================*/
 void web_start();

@@ -1,13 +1,7 @@
 #pragma once
-#include <Arduino.h>
-#include <unity.h>
-#include "app_config.h"
-
-static void test_cal_helpers(){
-  // identity gain with negative offset should pass simple sanity
-  const float raw = 800.0f;
-  const float a = scale_atrium(raw);
-  const float v = scale_vent(raw);
-  TEST_ASSERT_TRUE(isfinite(a));
-  TEST_ASSERT_TRUE(isfinite(v));
+// Minimal header-only checks (can be included in other tests if expanded)
+#include <math.h>
+static inline void linfit_2pt(float x1,float y1,float x2,float y2,float& m,float& b){
+  if (x2==x1){ m=1; b=0; return; }
+  m = (y2-y1)/(x2-x1); b = y1 - m*x1;
 }

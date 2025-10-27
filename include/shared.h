@@ -5,67 +5,52 @@
 #include <freertos/queue.h>
 #include "app_config.h"
 
-/*
-===============================================================================
-  Shared state (atomics) + command queue for inter-task/core communication
-  - Writers:
-      CONTROL task: pwm, valve, vent_mmHg, atr_mmHg, flow_ml_min, loopMs
-      WEB task (via queue): posts commands; may inline-apply if queue full
-      FLOW task: flow_ml_min
-  - Readers:
-      WEB (SSE), CONTROL, tests
-
-  Calibration override:
-    - When the calibration UI hits /api/pwm or /api/valve, it sets:
-        overrideOutputs=1; overrideUntilMs=millis()+3000
-      Control task will *skip* writing to hardware pins (and will not update
-      G.pwm/G.valve) while the override window is active, so manual values
-      stick. Each calibration call refreshes the 3s window.
-===============================================================================
-*/
-
-enum CmdType : uint8_t {
-  CMD_TOGGLE_PAUSE = 1,
-  CMD_SET_POWER_PCT,
-  CMD_SET_MODE,
-  CMD_SET_BPM
-};
-
-struct Cmd {
-  CmdType type;
-  int     iarg;     // power %, mode, etc.
-  float   farg;     // bpm, etc.
-};
+/* ==========================================================================================
+   shared.h — Cross-core shared state & commands
+   ------------------------------------------------------------------------------------------
+   Ownership:
+     • Written on Core 1 (control): pwm/valve writes, telemetry updates, loopMs.
+     • Read on Core 0 (web): SSE snapshot, HTTP handlers.
+     • Commands posted from Core 0 → consumed on Core 1 via FreeRTOS queue.
+   ==========================================================================================*/
 
 struct Shared {
-  // Commands / params (written by CONTROL and via queue)
-  std::atomic<int>    paused{1};         // 1=paused, 0=running
-  std::atomic<int>    powerPct{30};      // 10..100%
-  std::atomic<int>    mode{0};           // 0=FWD, 1=REV, 2=BEAT
-  std::atomic<float>  bpm{5.0f};         // beats per minute
+  // ---- Settings / state (UI-level) ----
+  std::atomic<int>   mode{MODE_FWD};        // 0=FWD,1=REV,2=BEAT  (Core0 write via cmd → Core1 consumes)
+  std::atomic<int>   paused{1};             // 0/1               (Core0 cmd / buttons on Core1)
+  std::atomic<int>   pwmSet{0};             // 0..255 setpoint (Core0 cmd / buttons; Core1 ramps to this)
+  std::atomic<int>   valve{VALVE_FWD};      // 0/1 current direction (Core1 writes; also raw override updates)
+  std::atomic<int>   bpm{30};               // [1..60]           (Core0 cmd)
 
-  // Outputs (CONTROL task writes normally; calibration may override)
-  std::atomic<unsigned> pwm{0};          // 0..255 raw LEDC
-  std::atomic<unsigned> valve{0};        // 1=forward, 0=reverse (binary)
+  // ---- Telemetry (calibrated where noted) ----
+  std::atomic<float> atr_mmHg{0};           // calibrated (Core1 write)
+  std::atomic<float> vent_mmHg{0};          // calibrated (Core1 write)
+  std::atomic<float> flow_L_min{0};         // computed from flow Hz (Core1 write)
+  std::atomic<float> loopMs{0};             // control loop EMA (Core1 write)
 
-  // Telemetry (CONTROL + FLOW tasks write)
-  std::atomic<float>  vent_mmHg{0.0f};
-  std::atomic<float>  atr_mmHg{0.0f};
-  std::atomic<float>  flow_ml_min{0.0f};
+  // ---- Raw diagnostics ----
+  std::atomic<int>   atr_raw{0};            // ADC counts (Core1 write)
+  std::atomic<int>   vent_raw{0};           // ADC counts (Core1 write)
+  std::atomic<float> flow_hz{0};            // edges/sec/2 (Core1 write)
 
-  // Performance (CONTROL writes)
-  std::atomic<float>  loopMs{2.0f};
+  // ---- Calibration coefficients (runtime) ----
+  std::atomic<float> atr_m{CAL_ATR_DEFAULT.m},  atr_b{CAL_ATR_DEFAULT.b};
+  std::atomic<float> vent_m{CAL_VENT_DEFAULT.m},vent_b{CAL_VENT_DEFAULT.b};
+  std::atomic<float> flow_m{CAL_FLOW_DEFAULT.m},flow_b{CAL_FLOW_DEFAULT.b};
 
-  // --- Calibration override gate ---
-  // When 1 and now < overrideUntilMs: control loop will NOT change HW pins
-  // nor overwrite G.pwm/G.valve. Calibration endpoints refresh the window.
-  std::atomic<int>      overrideOutputs{0};
-  std::atomic<uint32_t> overrideUntilMs{0};
+  // ---- Calibration override gate (Core0 /cal writes; Core1 respects) ----
+  std::atomic<int>      overrideOutputs{0};      // 1 = do not write to hardware from control loop
+  std::atomic<uint32_t> overrideUntilMs{0};      // millis() deadline; refreshed by /cal raw ops
 };
-
 extern Shared G;
 
-// Init queue & state; get queue; post command
-void          shared_init();
-QueueHandle_t shared_cmdq();
-bool          shared_cmd_post(const Cmd& c);
+// ---- Commands (Core0 → Core1) ----
+enum CmdType : uint8_t { CMD_TOGGLE, CMD_SET_PWM, CMD_SET_BPM, CMD_SET_MODE };
+struct Cmd { CmdType t; int i; };
+
+QueueHandle_t shared_cmdq();            // created in shared.cpp
+void         shared_init();             // create queue, init NVS cal load
+bool         shared_post(const Cmd&);   // non-blocking
+
+// ---- Helpers applying calibration ----
+static inline float apply_cal(float raw, float m, float b){ return m*raw + b; }
