@@ -1,0 +1,319 @@
+You are my senior embedded/firmware + web UI engineer
+
+Goal: Produce a complete, compilable PlatformIO project for an ESP32 Dev Module (Arduino framework) that implements the system below. I will upload my current project folders for reference only; do not copy or reuse that code verbatim. Instead, write a clean, from-scratch implementation that follows the specs here. If an edge case isn’t defined, prefer the simplest clear behavior.
+
+Architecture & Concurrency
+
+Cores
+
+Core 0 (Web/Networking): Open SoftAP (no password), SSID “SimUse-ESP32”; serve main UI and calibration UI; SSE at 60 Hz (fixed rate).
+
+Core 1 (Control/IO): Real-time control loop at 600 Hz; handles buttons, ADC reads, flow counting, valve & pump actuation.
+
+Libraries: Use ESPAsyncWebServer + AsyncTCP. Flow counting uses a GPIO ISR counting both edges (optional PCNT behind #if USE_PCNT, default off).
+
+C++ standard: C++14. Use static constexpr for constants, static inline helpers for math. Avoid inline variables (C++17).
+
+Code style: Small, readable functions. Heavy comments explaining what & why. Structured with clear comment banners per section. Centralize all tunables in app_config.h. No bloated abstractions.
+
+Hardware Mapping & Polarity
+
+Pins (define in app_config.h):
+
+Pump PWM (LEDC): GPIO 19, base frequency 6 kHz (fits 600 Hz control).
+
+Valve (digital out): GPIO 23.
+
+Pressure Atrium (ADC): GPIO 33.
+
+Pressure Ventricle (ADC): GPIO 32.
+
+Flow input (pulse): GPIO 27 (use internal pull-up as appropriate).
+
+Button A (Play/Pause): GPIO 14.
+
+Button B (PWM ±): GPIO 13.
+
+Status LED: GPIO 2.
+
+Polarity:
+
+Valve logic: valve=0 → Forward, valve=1 → Reverse.
+
+Flow edges: count Rising + Falling (both). Convert edges/sec → Hz by dividing by 2.
+
+ADC:
+
+Attenuation for both pressure channels: ADC_2_5db (~1.5 V FS).
+
+Pressure smoothing: moving average of 10 samples at 600 Hz (so a fresh smoothed value naturally exists at each 1/60 s tick).
+
+Signals, Units & Shared State
+
+In a singleton Shared G (atomics), include:
+
+Settings / state: mode (0=FWD,1=REV,2=BEAT), paused (0/1), pwm (0..255), valve (0/1), bpm (1..60).
+
+Telemetry (calibrated): atr_mmHg, vent_mmHg, flow_L_min, loopMs.
+
+Raw diagnostics: atr_raw, vent_raw (ADC counts), flow_hz (from edges).
+
+Calibration coefficients: atr_m, atr_b, vent_m, vent_b, flow_m, flow_b (flow defaults m=1/23.6, b=0).
+
+Calibration override flags for raw control from /cal only:
+
+std::atomic<int> overrideOutputs{0};
+
+std::atomic<uint32_t> overrideUntilMs{0}; // refreshes to now+3000 on each raw command
+
+Ownership / concurrency doc: At top of each module, document which thread writes/reads each field.
+
+Control Behavior & Timing (Core 1)
+
+Loop: 600 Hz periodic FreeRTOS task (pinned to Core 1).
+
+PWM carrier: 6 kHz via LEDC (8-bit, duty 0..255).
+
+Modes: 0=Forward, 1=Reverse, 2=Beat.
+
+Direction change sequence (FWD↔REV):
+ramp set→0 (150 ms) → dead 100 ms → flip valve → ramp 0→set (150 ms).
+No PWM floor; always ramp to/from 0.
+
+Beat mode: per half-period = 60000/(2·BPM). The above sequence always runs; any remaining time in the half-period becomes hold at set PWM.
+At 60 BPM (half-period 500 ms), hold = 100 ms (since 150+100+150=400 ms).
+
+Updates: PWM/BPM/Mode changes apply immediately (do not wait for beat boundary). PWM changes ramp to the new setpoint in 150 ms.
+
+Pause/Play rules:
+
+Pause only allowed when PWM=0. If running and Pause requested, ramp set→0 (150 ms), then pause (valve de-energized).
+
+Play ramps 0→set (150 ms) to resume.
+
+Buttons:
+
+A: Play/Pause (with pause rule).
+
+B short: +5 PWM (wrap: if >255 → 0).
+
+B long (single fire): −5 PWM (wrap: if <0 → 255).
+
+A+B chord: cycle Mode (FWD → REV → BEAT → FWD).
+
+Override gate (cal page only): If overrideOutputs==1 and millis()<overrideUntilMs, do not write to outputs (and do not change G.pwm/G.valve within control). When expired, control resumes normal writes.
+
+Flow Counting & Binning
+
+ISR counts both edges (optionally PCNT backend #if USE_PCNT).
+
+Dynamic measurement window: aim for ~10 pulses, with window clamped to [1/60 s, 1/6 s].
+
+When a measurement completes, compute Hz = edges / (2·window_s) and Flow [L/min] = Hz / 23.6.
+
+SSE still publishes at 60 Hz always. If no new flow measurement since last tick (e.g., low flow), publish last value.
+
+Web UI (Core 0)
+
+SoftAP (open) SSID: SimUse-ESP32 (no password).
+
+Routes:
+
+/ main UI (inline HTML/CSS/JS in PROGMEM).
+
+/cal calibration UI (inline HTML/JS).
+
+/stream SSE @ 60 Hz (fixed cadence).
+
+Control APIs (GET):
+
+/api/pwm?duty=0..255
+
+/api/bpm?b=1..60
+
+/api/mode?m=0|1|2
+
+/api/toggle
+
+Calibration raw control (POST):
+
+/api/pwm_raw body: duty=0..255 → immediate hardware write; sets overrideOutputs=1, overrideUntilMs=now+3000, updates G.pwm.
+
+/api/valve_raw body: dir=0|1 → immediate hardware write; same override; updates G.valve.
+
+Calibration data ops:
+
+POST /api/cal/capture → inputs: ch=atr|vent|flow, avgN (no global limit), optionally actualP, actualF; returns averaged raw(s).
+
+GET /api/cal/fit?ch=atr|vent|flow → returns m,b,r2,n.
+
+GET /api/cal/list → current coefficients in runtime/NVS.
+
+POST /api/cal/apply → per-sensor or all; apply current fits to runtime only.
+
+POST /api/cal/save → per-sensor or all; save current runtime coefficients to NVS.
+
+POST /api/cal/load → load NVS to runtime (no fit).
+
+POST /api/cal/defaults → restore built-in defaults to runtime (not saved unless save called).
+
+SSE payload (60 Hz): include all fields if feasible without lag:
+
+{
+  "mode":0|1|2, "paused":0|1, "pwm":0..255, "valve":0|1, "bpm":1..60, "loopMs":float,
+  "atr_mmHg":float, "vent_mmHg":float, "flow_L_min":float,
+  "atr_raw":int, "vent_raw":int, "flow_hz":float,
+  "cal":{"atr_m":float,"atr_b":float,"vent_m":float,"vent_b":float,"flow_m":float,"flow_b":float}
+}
+
+
+If bandwidth becomes an issue, it’s acceptable to omit the raw/cal block in the main page but keep it on /cal.
+
+UI look & behavior
+
+Single const UI = {...} at top defining axis ranges, colors, labels, units; no gridlines.
+
+Atrium: range [-5, 205] mmHg, color #0ea5e9
+
+Ventricle: [-5, 205] mmHg, color #ef4444
+
+Flow: [0, 7.5] L/min, color #f59e0b
+
+Valve: [0, 1], color #22c55e
+
+PWM: [0, 256], color #a78bfa
+
+Numeric tiles:
+
+Atrium (0 decimals), Ventricle (0 decimals),
+
+Flow L/min (2 decimals),
+
+PWM (0–255),
+
+Valve arrow: ▲ for 1, ▼ for 0 (never “–”).
+
+Controls:
+
+PWM: editable numeric + ±5 buttons with wrap (>255→0, <0→255); calls /api/pwm.
+
+BPM: editable numeric + ±5 buttons; calls /api/bpm.
+
+Mode: selector (FWD/REV/BEAT); calls /api/mode.
+
+Play/Pause button; calls /api/toggle.
+
+Canvas plotting must be device-pixel-ratio safe, fixed ranges, graceful resize.
+
+Calibration UX
+
+Workflow:
+
+Open /cal.
+
+Set avgN, manual PWM and Valve using raw endpoints (starts/refreshes 3 s override so control loop doesn’t fight).
+
+Type actual Pressure / actual Flow; Capture to log averaged raw readings + actuals.
+
+After enough points, Fit per-channel to get m,b,r²,n.
+
+Apply (runtime) per chosen channel(s); Save (NVS) per chosen channel(s).
+Do not auto-apply on fit.
+
+Persistence:
+
+Use Preferences/NVS namespace cal. Store atr_m, atr_b, vent_m, vent_b, flow_m, flow_b. Provide Load and Defaults actions.
+
+Project Structure (exact)
+include/
+  app_config.h
+  shared.h
+  buttons.h
+  control.h
+  io.h
+  flow.h
+  web.h
+  web_cal.h
+lib/
+  buttons/src/buttons.cpp
+  control/src/control.cpp
+  io/src/io.cpp
+  flow/src/flow.cpp
+  shared/src/shared.cpp
+  web/src/web.cpp
+  web/src/web_cal.cpp
+src/
+  main.cpp
+test/
+  test_flow_math.cpp
+  test_cal_helpers.h
+platformio.ini
+
+Build Settings
+
+platformio.ini:
+
+platform = espressif32, board = esp32dev, framework = arduino
+
+monitor_speed = 921600, monitor_filters = time
+
+build_flags (global): -Iinclude, -std=gnu++14, -D ARDUINO_USB_MODE=1, -D ARDUINO_USB_CDC_ON_BOOT=0, -Wno-address
+
+build_src_flags (project sources only): -Wall -Wextra -Wno-unused-parameter
+
+lib_deps:
+
+esphome/AsyncTCP-esphome @ ^2.1.4
+
+esphome/ESPAsyncWebServer-esphome @ ^3.4.0
+
+local libs by relative path: lib/buttons, lib/control, lib/io, lib/flow, lib/shared, lib/web
+
+lib_ldf_mode = deep+
+
+Acceptance Criteria
+
+Cores pinned correctly: Web/SSE on Core 0; Control loop on Core 1.
+
+Valve UI: chart range 0..1; arrow ▲ for 1, ▼ for 0 only.
+
+Flow: UI shows L/min (2 decimals), range 0..7.5; SSE maintains 60 Hz updates (hold last value as needed).
+
+Pressure smoothing: 10-sample moving average @600 Hz; UI updates at 60 Hz.
+
+Direction control: exact sequence on any direction change; Beat uses remaining time for hold.
+
+Immediate updates: PWM/BPM/Mode changes take effect quickly (ramp, no beat boundary waits).
+
+Buttons: A toggles Play/Pause with ramp-to-0 rule; B short +5, B long (single) −5 with wrap; A+B cycles modes.
+
+Calibration: Raw endpoints override control for ~3 s; capture/fit/apply/save per channel; cal is not auto-applied.
+
+Persistence: cal in NVS; defaults restorable; cal values visible in UI.
+
+Builds cleanly under PlatformIO; tests compile.
+
+Tests
+
+test_flow_math.cpp: edges→Hz (÷2), Hz→L/min (÷23.6), window clamps [1/60, 1/6] s.
+
+test_cal_helpers.h: header-only checks for linear fit and scaling.
+
+Output Format (strict)
+
+For every file in the structure above, output:
+
+<path/from/project-root>
+```cpp
+<entire file content>
+
+
+No explanations between files.
+
+All code must be copy-paste ready and self-consistent.
+
+Ensure includes match, tasks are pinned, and APIs/JS align.
+
+Use clear comment banners per section and centralize constants in app_config.h and a UI const object in the HTML/JS.
+
+Important: I will upload my current folders for reference only; do not duplicate that code. Use them purely to clarify intent if needed; otherwise write a clean, modern, well-commented implementation per this prompt.

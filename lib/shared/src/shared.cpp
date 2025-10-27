@@ -16,7 +16,10 @@ bool shared_post(const Cmd& c){
 
 static void load_cal_from_nvs(){
   Preferences p;
-  if (!p.begin(NS_CAL, true)) return;
+  // Open NVS namespace for read/write. Using read-write here avoids an
+  // ESP-IDF-level NOT_FOUND log when the namespace hasn't been created yet
+  // (first boot). We still treat failure as non-fatal and simply return.
+  if (!p.begin(NS_CAL, false)) return;
   float am = p.getFloat("atr_m",  G.atr_m.load());
   float ab = p.getFloat("atr_b",  G.atr_b.load());
   float vm = p.getFloat("ven_m",  G.vent_m.load());

@@ -31,7 +31,10 @@ struct MA {
   inline float mean() const { return n? (sum/n):0; }
 };
 
-void control_start(){
+// Move the main control loop into a FreeRTOS task so `control_start()`
+// can return immediately and allow other subsystems (like web_start)
+// to initialize. This pins the control loop to CORE_CONTROL.
+static void control_task(void* /*arg*/){
   // Blink & queue ready
   pinMode(PIN_STATUS_LED, OUTPUT);
 
@@ -233,4 +236,12 @@ void control_start(){
 
     vTaskDelayUntil(&wake, period);
   }
+}
+
+void control_start(){
+  // Create the control task pinned to CORE_CONTROL. Stack and priority chosen
+  // to give the 600 Hz loop enough headroom; adjust if needed.
+  const uint32_t stack = 8192; // bytes
+  const UBaseType_t prio = 3;
+  xTaskCreatePinnedToCore(control_task, "control", stack/sizeof(portSTACK_TYPE), nullptr, prio, nullptr, CORE_CONTROL);
 }
