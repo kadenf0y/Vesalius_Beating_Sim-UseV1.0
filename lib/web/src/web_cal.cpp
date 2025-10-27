@@ -195,8 +195,8 @@ void web_cal_register(AsyncWebServer& srv, const CalHooks& H){
     String body = req->getParam("plain", true)->value();
     // naive parse (small JSON): look for keys
     auto findVal=[&](const char* key)->float{
-      int i = body.indexOf(String("\"")+key+"\":"); if (i<0) return NAN;
-      i += String("\"")+key+"\":".length();
+      int i = body.indexOf(String("\"") + key + "\":"); if (i<0) return NAN;
+      i += (String("\"") + key + "\":").length();
       return body.substring(i).toFloat();
     };
     float am=findVal("atr_m"),ab=findVal("atr_b"),vm=findVal("vent_m"),vb=findVal("vent_b"),fm=findVal("flow_m"),fb=findVal("flow_b");
