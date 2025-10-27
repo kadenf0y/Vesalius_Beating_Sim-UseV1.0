@@ -34,8 +34,8 @@ static constexpr uint8_t  PUMP_LEDC_CH     = 0;
 // ===== Pins (ESP32 Dev Module) =====
 static constexpr uint8_t PIN_PUMP_PWM      = 19;  // LEDC out
 static constexpr uint8_t PIN_VALVE         = 23;  // digital out (0=FWD, 1=REV)
-static constexpr uint8_t PIN_PRESS_ATR     = 33;  // ADC1
-static constexpr uint8_t PIN_PRESS_VENT    = 32;  // ADC1
+static constexpr uint8_t PIN_PRESS_ATR     = 32;  // ADC1
+static constexpr uint8_t PIN_PRESS_VENT    = 33;  // ADC1
 static constexpr uint8_t PIN_FLOW          = 27;  // pulse in
 static constexpr uint8_t PIN_BTN_A         = 14;  // Play/Pause (active LOW)
 static constexpr uint8_t PIN_BTN_B         = 13;  // PWM ± (active LOW)

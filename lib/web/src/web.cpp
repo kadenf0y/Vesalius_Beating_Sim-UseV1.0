@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
 #include "web.h"
 #include "web_cal.h"
 #include "shared.h"
@@ -20,152 +21,204 @@
 static AsyncWebServer server(kHttpPort);
 static AsyncEventSource sse("/stream");
 
-// ---- Minimal dark main UI (inline; fixed ranges; DPR-safe plotting) ----
+// ---- UI (inline HTML served from flash) ----
 static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html><meta charset="utf-8">
-<title>SimUse</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SimUse — Live</title>
 <style>
- body{background:#0b0f13;color:#e6edf3;font:14px/1.4 system-ui;margin:0}
- .wrap{max-width:1100px;margin:0 auto;padding:10px}
- h1{font-size:18px;margin:10px 0}
- .grid{display:grid;grid-template-columns:2fr 1fr;gap:10px}
- .card{border:1px solid #243042;border-radius:12px;background:#0e141b;padding:10px}
- .row{display:flex;gap:10px;align-items:center;margin:6px 0}
- button,input,select{background:#12181f;border:1px solid #283241;color:#e6edf3;border-radius:8px;padding:6px 10px}
- canvas{width:100%;height:120px;background:#0b0f13;border-radius:8px}
- .tile{display:flex;flex-direction:column;align-items:center;justify-content:center;height:80px;border:1px solid #243042;border-radius:10px;background:#0b0f13}
- .big{font-weight:800;font-size:28px}
- .muted{color:#9aa7b2;font-size:12px}
- .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
- .arrow{font-size:28px;color:#22c55e;line-height:1}
- a{color:#8ab4f8;text-decoration:none}
+  :root{--bg:#0f1317;--panel:#151a20;--ink:#e6edf3;--muted:#9aa7b2;--grid:#26303a;
+         --cyan:#0ea5e9;--red:#ef4444;--amber:#f59e0b;--green:#22c55e;--violet:#a78bfa}
+  *{box-sizing:border-box} html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,Segoe UI,Roboto,Arial}
+  .top{display:flex;gap:8px;align-items:center;padding:8px 12px;background:#0c1014;border-bottom:1px solid var(--grid)}
+  .pill{font-size:12px;color:var(--muted);border:1px solid var(--grid);border-radius:999px;padding:4px 10px}
+  .main{display:grid;gap:12px;padding:10px;grid-template-columns:minmax(420px,1fr) minmax(120px,160px) minmax(120px,160px);height:calc(100vh - 56px)}
+  .col{display:grid;grid-template-rows:repeat(5,1fr);gap:10px;min-height:0}
+  .panel{background:var(--panel);border:1px solid var(--grid);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+  .panelHeader{padding:6px 10px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--grid);display:flex;justify-content:space-between}
+  .panelBody{flex:1;min-height:0;padding:8px}
+  canvas{width:100%;height:100%;display:block;background:#0b0f13;border-radius:6px}
+  .big{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;min-height:0}
+  .big .val{font-weight:900;font-size:28px}
+  .muted{color:var(--muted);font-size:12px}
+  .val-cyan{color:var(--cyan)}.val-red{color:var(--red)}.val-amber{color:var(--amber)}.val-violet{color:var(--violet)}.val-green{color:var(--green)}
+  .controls{display:flex;flex-direction:column;align-items:stretch;gap:10px;padding:12px}
+  /* each control row stacks label above the controls for clearer alignment */
+  .controls .row{display:flex;flex-direction:column;align-items:stretch;gap:6px}
+  .controls .row label{width:auto;flex:0 0 auto;margin:0 0 6px 0}
+  .controls .row .ctrl{flex:1;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .seg{display:flex;border:1px solid var(--grid);border-radius:10px;overflow:hidden;flex-direction:column;width:100%}
+  .seg button{padding:6px;border:0;background:transparent;color:var(--muted);cursor:pointer;width:100%;text-align:center}
+  .seg button.active{background:#142033;color:var(--ink)}
+  .row{display:flex;gap:8px;align-items:center;justify-content:space-between}
+  .btn{padding:6px 8px;border-radius:8px;border:1px solid var(--grid);background:#0f1317;color:var(--ink);cursor:pointer;min-width:40px}
+  .btn-play{background:#0f3f11;color:#eaffef;border-color:#244f1d}
+  .btn-pause{background:#3b0f0f;color:#ffecec;border-color:#5a1616}
+  @media (max-width:900px){ .main{grid-template-columns:1fr} }
 </style>
-<div class="wrap">
-  <h1>SimUse ESP32 <span class="muted">• <a href="/cal">Calibration</a></span></h1>
-  <div class="grid">
-    <div class="card">
-      <div class="row muted">Live signals (fixed ranges)</div>
-      <canvas id="atr"></canvas>
-      <canvas id="vent"></canvas>
-      <canvas id="flow"></canvas>
-      <canvas id="valv"></canvas>
-      <canvas id="pwm"></canvas>
+</head><body>
+  <div class="top">
+    <div class="pill">SSE: <b id="sse">INIT</b></div>
+    <div class="pill">IP: <b id="ip">—</b></div>
+    <div style="flex:1"></div>
+    <div class="pill">FPS: <b id="fps">—</b></div>
+    <div class="pill">Loop: <b id="loop">—</b></div>
+  </div>
+
+  <div class="main">
+    <div class="col">
+      <div class="panel"><div class="panelHeader"><span>Atrium</span><span class="muted">mmHg</span></div>
+        <div class="panelBody"><canvas id="cv-atr"></canvas></div></div>
+      <div class="panel"><div class="panelHeader"><span>Ventricle</span><span class="muted">mmHg</span></div>
+        <div class="panelBody"><canvas id="cv-vent"></canvas></div></div>
+      <div class="panel"><div class="panelHeader"><span>Flow</span><span class="muted">L/min</span></div>
+        <div class="panelBody"><canvas id="cv-flow"></canvas></div></div>
+      <div class="panel"><div class="panelHeader"><span>Valve</span><span class="muted">0/1</span></div>
+        <div class="panelBody"><canvas id="cv-valve"></canvas></div></div>
+      <div class="panel"><div class="panelHeader"><span>PWM</span><span class="muted">0–255</span></div>
+        <div class="panelBody"><canvas id="cv-pwm"></canvas></div></div>
     </div>
-    <div class="card">
-      <div class="two">
-        <div class="tile"><div class="big" id="nAtr">—</div><div class="muted">Atrium mmHg</div></div>
-        <div class="tile"><div class="big" id="nVent">—</div><div class="muted">Ventricle mmHg</div></div>
-        <div class="tile"><div class="big" id="nFlow">—</div><div class="muted">Flow L/min</div></div>
-        <div class="tile"><div class="arrow" id="nValve">—</div><div class="muted">Valve (▲=1, ▼=0)</div></div>
-        <div class="tile"><div class="big" id="nPwm">—</div><div class="muted">PWM (0–255)</div></div>
-        <div class="tile"><div class="big" id="nBpm">—</div><div class="muted">BPM</div></div>
+
+    <div class="col" style="grid-template-rows:repeat(5,auto)">
+      <div class="panel big"><div class="big"><div class="val val-cyan" id="n-atr">—</div><div class="muted">Atrium mmHg</div></div></div>
+      <div class="panel big"><div class="big"><div class="val val-red" id="n-vent">—</div><div class="muted">Ventricle mmHg</div></div></div>
+      <div class="panel big"><div class="big"><div class="val val-amber" id="n-flow">—</div><div class="muted">Flow L/min</div></div></div>
+      <div class="panel big"><div class="big"><div class="val val-green" id="n-valve">-</div><div class="muted">Valve ▲=1 ▼=0</div></div></div>
+    <div class="panel big"><div class="big"><div class="val val-violet" id="n-pwm">—</div><div class="muted">POWER</div></div></div>
+    </div>
+
+    <div class="panel controls">
+      <div style="width:100%"><button id="btnToggle" class="btn btn-play">Play</button></div>
+      <div class="row" style="width:100%"><label class="muted">Mode</label>
+        <div class="seg" id="modeSeg"><button data-m="0">Forward</button><button data-m="1">Reverse</button><button data-m="2">Beat</button></div>
       </div>
-      <hr style="border-color:#243042">
-      <div class="row"><label>Mode</label>
-        <select id="mode"><option value="0">Forward</option><option value="1">Reverse</option><option value="2">Beat</option></select>
+      <div class="row" style="width:100%"><label class="muted">POWER</label>
+        <div class="ctrl">
+          <div style="display:flex;flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
+              <button id="btnPwmPlus" class="btn">+5</button>
+              <input id="pwmIn" type="number" min="0" max="255" value="0" style="width:72px;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
+              <button id="btnPwmMinus" class="btn">-5</button>
+            </div>
+            <div style="flex:1;min-width:8px"></div>
+          </div>
+        </div>
       </div>
-      <div class="row"><label>PWM</label>
-        <input id="pwmIn" type="number" min="0" max="255" value="0">
-        <button onclick="setPwm(+(document.getElementById('pwmIn').value||0))">Set</button>
-        <button onclick="nudge(5)">+5</button>
-        <button onclick="nudge(-5)">−5</button>
+      <div class="row" style="width:100%"><label class="muted">BPM</label>
+        <div class="ctrl">
+          <div style="display:flex;flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
+              <button id="btnBpmPlus" class="btn">+5</button>
+              <input id="bpmIn" type="number" min="1" max="60" value="30" style="width:72px;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
+              <button id="btnBpmMinus" class="btn">-5</button>
+            </div>
+            <div style="flex:1;min-width:8px"></div>
+          </div>
+        </div>
       </div>
-      <div class="row"><label>BPM</label>
-        <input id="bpmIn" type="number" min="1" max="60" value="30">
-        <button onclick="setBpm(+(document.getElementById('bpmIn').value||0))">Set</button>
-      </div>
-      <div class="row">
-        <button onclick="toggle()">Play/Pause</button>
-      </div>
+      <div style="margin-top:6px"><a href="/cal" class="btn" style="text-decoration:none;display:inline-block">Calibration</a></div>
     </div>
   </div>
-</div>
+
 <script>
-const UI = {
-  atr:{min:-5,max:205,color:'#0ea5e9'},
-  vent:{min:-5,max:205,color:'#ef4444'},
-  flow:{min:0,max:7.5,color:'#f59e0b'},
-  valve:{min:0,max:1,color:'#22c55e'},
-  pwm:{min:0,max:256,color:'#a78bfa'}
-};
+// small helpers
+const $ = id => document.getElementById(id);
+try{ if($('ip')) $('ip').textContent = location.host || '192.168.4.1'; }catch(e){}
 
-function strip(canvas, cfg){
-  const ctx = canvas.getContext('2d'); const buf=[];
-  function push(v){
-    const t=performance.now()/1000; buf.push({t,v});
-    while(buf.length && t-buf[0].t>5) buf.shift();
-    render();
-  }
-  function render(){
-    const w=canvas.clientWidth|0, h=canvas.clientHeight|0;
-    if (canvas.width!==w||canvas.height!==h){ canvas.width=w; canvas.height=h; }
-    ctx.clearRect(0,0,w,h); ctx.strokeStyle=cfg.color; ctx.lineWidth=2;
-    const X=t=> ((t%5)/5)*w;
-    const Y=v=> h - (Math.max(cfg.min, Math.min(cfg.max,v)) - cfg.min)/(cfg.max-cfg.min)*h;
-    for(let i=1;i<buf.length;i++){
-      const a=buf[i-1], b=buf[i]; const xa=X(a.t), xb=X(b.t);
-      ctx.globalAlpha = Math.max(0,1-((performance.now()/1000-b.t)/5));
-      ctx.beginPath(); ctx.moveTo(xa,Y(a.v)); ctx.lineTo(xb,Y(b.v)); ctx.stroke();
+function fitCanvas(c, ctx){ const w=c.clientWidth|0, h=c.clientHeight|0; if(c.width!==w||c.height!==h){ c.width=w; c.height=h; } ctx.setTransform(1,0,0,1,0,0); }
+function drawGrid(ctx,W,H){ ctx.save(); ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--grid').trim()||'#26303a'; ctx.lineWidth=1; ctx.beginPath(); for(let x=0;x<=W;x+=W/5){ ctx.moveTo(x+0.5,0); ctx.lineTo(x+0.5,H); } for(let y=0;y<=H;y+=H/4){ ctx.moveTo(0,y+0.5); ctx.lineTo(W,y+0.5); } ctx.stroke(); ctx.restore(); }
+
+function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]; const WIN=5.0;
+  let lastW=0, lastH=0;
+  function push(v){ const t=performance.now()/1000; buf.push({t,v}); while(buf.length && (performance.now()/1000 - buf[0].t)>WIN) buf.shift(); render(); }
+  function render(){ fitCanvas(c,ctx); const W=c.width,H=c.height;
+    // if resized, clear and redraw background grid
+    if (W!==lastW || H!==lastH){ ctx.clearRect(0,0,W,H); drawGrid(ctx,W,H); lastW=W; lastH=H; }
+    if(buf.length<1) return;
+    // We intentionally do NOT clear the data layer each frame so new samples overwrite old pixels.
+    // Map time to X using modulo so data advances left->right and wraps back to 0.
+    const X = t => ((t % WIN) / WIN) * W;
+    const Y = v => H - ((Math.max(cfg.min,Math.min(cfg.max,v)) - cfg.min)/(cfg.max-cfg.min)) * H;
+    ctx.lineWidth = 2; ctx.strokeStyle = cfg.color; ctx.globalAlpha = 1; ctx.lineJoin='round'; ctx.lineCap='round';
+    // draw a background-colored vertical bar centered at the newest sample X so it moves with the data
+    const bg = (getComputedStyle(document.documentElement).getPropertyValue('--bg')||'#0b0f13').trim();
+    const last = buf[buf.length-1];
+    const xb_latest = X(last.t);
+  const barW = 100;
+    ctx.fillStyle = bg;
+    // draw the bar as one or two integer-aligned rects to avoid per-pixel gaps and anti-aliasing
+    const start = Math.round(xb_latest - Math.floor(barW/2));
+    const s = ((start % W) + W) % W; // wrapped start
+    if (s + barW <= W) {
+      // single rect
+      ctx.fillRect(s, 0, barW, H);
+    } else {
+      // wrapped: two rects
+      const w1 = W - s;
+      const w2 = barW - w1;
+      ctx.fillRect(s, 0, w1, H);
+      ctx.fillRect(0, 0, w2, H);
     }
-    ctx.globalAlpha=1;
+
+    // draw segments, but don't connect across wrap boundaries; when wrapping, draw a small dot at wrapped X
+    for(let i=1;i<buf.length;i++){
+      const a = buf[i-1], b = buf[i]; const ta = a.t % WIN, tb = b.t % WIN;
+      const xa = X(a.t), xb = X(b.t);
+      if (tb < ta){ // wrapped: draw a small dot at xb (data drawn on top of the background bar)
+        const r = Math.max(1, Math.min(3, Math.round(Math.max(1, Math.min(3, Math.floor(W/200))))));
+        ctx.fillStyle = cfg.color;
+        ctx.beginPath(); ctx.arc(xb, Y(b.v), r, 0, Math.PI*2); ctx.fill();
+      } else {
+        ctx.beginPath(); ctx.strokeStyle = cfg.color; ctx.moveTo(xa, Y(a.v)); ctx.lineTo(xb, Y(b.v)); ctx.stroke();
+      }
+    }
   }
-  addEventListener('resize', render);
-  return {push, render};
-}
-const sAtr=strip(document.getElementById('atr'), UI.atr);
-const sVent=strip(document.getElementById('vent'), UI.vent);
-const sFlow=strip(document.getElementById('flow'), UI.flow);
-const sValv=strip(document.getElementById('valv'), UI.valve);
-const sPwm= strip(document.getElementById('pwm'),  UI.pwm);
+  window.addEventListener('resize', ()=>{ lastW=0; lastH=0; render(); }); return { push, render }; }
 
-function setTxt(id,v,fix){ document.getElementById(id).textContent = (v==null?'—':(fix!=null?Number(v).toFixed(fix):v)); }
+const sAtr = makeStrip('cv-atr',{min:-5,max:205,color:'#0ea5e9'});
+const sVent= makeStrip('cv-vent',{min:-5,max:205,color:'#ef4444'});
+const sFlow= makeStrip('cv-flow',{min:0,max:7.5,color:'#f59e0b'});
+const sValve=makeStrip('cv-valve',{min:0,max:1,color:'#22c55e'});
+const sPwm = makeStrip('cv-pwm',{min:0,max:255,color:'#a78bfa'});
 
-function setPwm(v){ fetch('/api/pwm?duty='+Math.max(0,Math.min(255,v))); }
-function setBpm(v){ v=Math.max(1,Math.min(60,v)); fetch('/api/bpm?b='+v); }
-function toggle(){ fetch('/api/toggle'); }
-function nudge(d){ const el=document.getElementById('pwmIn'); let v=(+el.value||0)+d; if(v>255)v=0; if(v<0)v=255; el.value=v; setPwm(v); }
-document.getElementById('mode').addEventListener('change', e=> fetch('/api/mode?m='+Number(e.target.value||0)));
+function setNum(id,v,fix){ if(!$(id)) return; $(id).textContent = (v==null)?'—':(fix!=null?Number(v).toFixed(fix):v); }
 
-const es = new EventSource('/stream');
-es.onmessage = ev=>{
-  const d = JSON.parse(ev.data);
-  sAtr.push(d.atr_mmHg); sVent.push(d.vent_mmHg); sFlow.push(d.flow_L_min);
-  sValv.push(d.valve?1:0); sPwm.push(d.pwm);
-  setTxt('nAtr', d.atr_mmHg|0); setTxt('nVent', d.vent_mmHg|0); setTxt('nFlow', d.flow_L_min,2);
-  setTxt('nPwm', d.pwm); setTxt('nBpm', d.bpm);
-  document.getElementById('nValve').textContent = d.valve? '▲' : '▼';
-  // mirror controls (no lockout)
-  document.getElementById('pwmIn').value = d.pwm;
-  document.getElementById('bpmIn').value = d.bpm;
-  document.getElementById('mode').value = d.mode;
+// Controls
+function post(url){ fetch(url).catch(()=>{}); }
+if($('btnToggle')) $('btnToggle').addEventListener('click',()=>post('/api/toggle'));
+// Apply buttons removed; inputs auto-apply via +5/-5 or on change handlers
+if($('btnPwmPlus')) $('btnPwmPlus').addEventListener('click',()=>{ adjustPwm(5); });
+if($('btnPwmMinus')) $('btnPwmMinus').addEventListener('click',()=>{ adjustPwm(-5); });
+if($('btnBpmPlus')) $('btnBpmPlus').addEventListener('click',()=>{ adjustBpm(5); });
+if($('btnBpmMinus')) $('btnBpmMinus').addEventListener('click',()=>{ adjustBpm(-5); });
+// auto-apply: also post when input values change
+if($('pwmIn')) $('pwmIn').addEventListener('change', ()=>{ const v=Number($('pwmIn').value||0); post('/api/pwm?duty='+Math.max(0,Math.min(255,v))); });
+if($('bpmIn')) $('bpmIn').addEventListener('change', ()=>{ const v=Number($('bpmIn').value||30); post('/api/bpm?b='+Math.max(1,Math.min(60,v))); });
+document.querySelectorAll('#modeSeg button').forEach(b=> b.addEventListener('click', e=>{ post('/api/mode?m='+b.dataset.m); }));
+
+function adjustPwm(d){ const el=$('pwmIn'); if(!el) return; let v=Number(el.value||0); v = Math.max(0, Math.min(255, v + d)); el.value = v; post('/api/pwm?duty='+v); }
+function adjustBpm(d){ const el=$('bpmIn'); if(!el) return; let v=Number(el.value||0); v = Math.max(1, Math.min(60, v + d)); el.value = v; post('/api/bpm?b='+v); }
+
+// SSE receiver — uses server keys: atr_mmHg, vent_mmHg, flow_L_min, pwm, valve, mode, bpm, loopMs
+const es = new EventSource('/stream'); let last=performance.now(), ema=0;
+es.onopen=()=>$('sse')? $('sse').textContent='OPEN' : null; es.onerror=()=>$('sse')? $('sse').textContent='ERR' : null;
+es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; const fps=1000/Math.max(1,dt); ema= ema? (ema*0.98 + fps*0.02) : fps; if($('fps')) $('fps').textContent=Math.round(ema);
+  try{ const d=JSON.parse(ev.data);
+    sAtr.push(Number(d.atr_mmHg)||0); sVent.push(Number(d.vent_mmHg)||0); sFlow.push(Number(d.flow_L_min)||0);
+    sValve.push(d.valve?1:0); sPwm.push(Number(d.pwm)||0);
+    setNum('n-atr', d.atr_mmHg, 1); setNum('n-vent', d.vent_mmHg, 1); setNum('n-flow', d.flow_L_min, 2); setNum('n-pwm', d.pwm,0);
+    if($('n-valve')) $('n-valve').textContent = d.valve? '▲' : '▼';
+    document.querySelectorAll('#modeSeg button').forEach(b=> b.classList.toggle('active', Number(b.dataset.m)===Number(d.mode||0)));
+    if($('pwmIn')) $('pwmIn').value = d.pwm||0; if($('bpmIn')) $('bpmIn').value = d.bpm||0; if(d.loopMs && $('loop')) $('loop').textContent = Number(d.loopMs).toFixed(2)+' ms';
+    if($('btnToggle')){
+      const b=$('btnToggle'); if(Number(d.paused||0)===0){ b.textContent='Pause'; b.classList.remove('btn-play'); b.classList.add('btn-pause'); } else { b.textContent='Play'; b.classList.remove('btn-pause'); b.classList.add('btn-play'); }
+    }
+  }catch(e){}
 };
-</script>
-)HTML";
 
-// ---- NVS helpers for cal ----
-#include <Preferences.h>
-static bool nvs_save_all(bool atr,bool vent,bool flow){
-  Preferences p; if (!p.begin("cal", false)) return false;
-  if (atr){  p.putFloat("atr_m",  G.atr_m.load());  p.putFloat("atr_b",  G.atr_b.load()); }
-  if (vent){ p.putFloat("ven_m",  G.vent_m.load()); p.putFloat("ven_b",  G.vent_b.load()); }
-  if (flow){ p.putFloat("flo_m",  G.flow_m.load()); p.putFloat("flo_b",  G.flow_b.load()); }
-  p.end(); return true;
-}
-static bool nvs_load_all(){
-  Preferences p; if (!p.begin("cal", true)) return false;
-  G.atr_m.store(p.getFloat("atr_m",  G.atr_m.load()));
-  G.atr_b.store(p.getFloat("atr_b",  G.atr_b.load()));
-  G.vent_m.store(p.getFloat("ven_m",  G.vent_m.load()));
-  G.vent_b.store(p.getFloat("ven_b",  G.vent_b.load()));
-  G.flow_m.store(p.getFloat("flo_m",  G.flow_m.load()));
-  G.flow_b.store(p.getFloat("flo_b",  G.flow_b.load()));
-  p.end(); return true;
-}
-static void nvs_defaults_all(){
-  G.atr_m.store(CAL_ATR_DEFAULT.m);   G.atr_b.store(CAL_ATR_DEFAULT.b);
-  G.vent_m.store(CAL_VENT_DEFAULT.m); G.vent_b.store(CAL_VENT_DEFAULT.b);
-  G.flow_m.store(CAL_FLOW_DEFAULT.m); G.flow_b.store(CAL_FLOW_DEFAULT.b);
-}
+window.addEventListener('load', ()=>{ sAtr.render(); sVent.render(); sFlow.render(); sValve.render(); sPwm.render(); });
+</script>
+</body></html>
+)HTML";
 
 // ---- SSE task @ 60 Hz on Core 0 ----
 static void sse_task(void*){
@@ -219,6 +272,33 @@ static void get_cals(float& am,float& ab,float& vm,float& vb,float& fm,float& fb
 }
 static void set_cals(float am,float ab,float vm,float vb,float fm,float fb){
   G.atr_m.store(am); G.atr_b.store(ab); G.vent_m.store(vm); G.vent_b.store(vb); G.flow_m.store(fm); G.flow_b.store(fb);
+}
+// NVS helpers used by the calibration UI hooks
+static bool nvs_save_all(bool atr,bool vent,bool flow){
+  Preferences p; if(!p.begin("cal", false)) return false;
+  if (atr){ p.putFloat("atr_m", G.atr_m.load()); p.putFloat("atr_b", G.atr_b.load()); }
+  if (vent){ p.putFloat("ven_m", G.vent_m.load()); p.putFloat("ven_b", G.vent_b.load()); }
+  if (flow){ p.putFloat("flo_m", G.flow_m.load()); p.putFloat("flo_b", G.flow_b.load()); }
+  p.end(); return true;
+}
+static bool nvs_load_all(){
+  Preferences p; if(!p.begin("cal", false)) return false;
+  float am = p.getFloat("atr_m",  G.atr_m.load());
+  float ab = p.getFloat("atr_b",  G.atr_b.load());
+  float vm = p.getFloat("ven_m",  G.vent_m.load());
+  float vb = p.getFloat("ven_b",  G.vent_b.load());
+  float fm = p.getFloat("flo_m",  G.flow_m.load());
+  float fb = p.getFloat("flo_b",  G.flow_b.load());
+  p.end();
+  G.atr_m.store(am);  G.atr_b.store(ab);
+  G.vent_m.store(vm); G.vent_b.store(vb);
+  G.flow_m.store(fm); G.flow_b.store(fb);
+  return true;
+}
+static void nvs_defaults_all(){
+  G.atr_m.store(CAL_ATR_DEFAULT.m); G.atr_b.store(CAL_ATR_DEFAULT.b);
+  G.vent_m.store(CAL_VENT_DEFAULT.m); G.vent_b.store(CAL_VENT_DEFAULT.b);
+  G.flow_m.store(CAL_FLOW_DEFAULT.m); G.flow_b.store(CAL_FLOW_DEFAULT.b);
 }
 static int  read_atr_raw(){ return G.atr_raw.load(); }
 static int  read_vent_raw(){ return G.vent_raw.load(); }
