@@ -189,42 +189,42 @@ function makeStrip(id, cfg){ const c=$(id);
     // if resized, clear and redraw background grid
     if (W!==lastW || H!==lastH){ ctx.clearRect(0,0,W,H); drawGrid(ctx,W,H); lastW=W; lastH=H; }
     if(buf.length<1) return;
-    // We intentionally do NOT clear the data layer each frame so new samples overwrite old pixels.
-    // Map time to X using modulo so data advances left->right and wraps back to 0.
+    // Clear the drawing layer and redraw the entire buffer each frame. This guarantees
+    // that only the current buffer is visible at any X coordinate and avoids artifacts
+    // caused by incremental background overdraw or compositing seams.
+    ctx.clearRect(0, 0, W, H);
+    drawGrid(ctx, W, H);
     const X = t => ((t % WIN) / WIN) * W;
     const Y = v => H - ((Math.max(cfg.min,Math.min(cfg.max,v)) - cfg.min)/(cfg.max-cfg.min)) * H;
     ctx.lineWidth = 2; ctx.strokeStyle = cfg.color; ctx.globalAlpha = 1; ctx.lineJoin='round'; ctx.lineCap='round';
-  // draw a background-colored vertical bar centered at the newest sample X so it moves with the data
-  // Use the canvas's own background color when available so the refresh bar exactly matches the graph background
-  const canvasBg = getComputedStyle(c).backgroundColor || null;
-  const bg = (canvasBg && canvasBg.trim()) || (getComputedStyle(document.documentElement).getPropertyValue('--bg')||'#0b0f13').trim();
-    const last = buf[buf.length-1];
-    const xb_latest = X(last.t);
-  const barW = 100;
-    ctx.fillStyle = bg;
-    // draw the bar as one or two integer-aligned rects to avoid per-pixel gaps and anti-aliasing
-    const start = Math.round(xb_latest - Math.floor(barW/2));
-    const s = ((start % W) + W) % W; // wrapped start
-    if (s + barW <= W) {
-      // single rect
-      ctx.fillRect(s, 0, barW, H);
-    } else {
-      // wrapped: two rects
-      const w1 = W - s;
-      const w2 = barW - w1;
-      ctx.fillRect(s, 0, w1, H);
-      ctx.fillRect(0, 0, w2, H);
-    }
 
     // draw segments. If cfg.step is true, render as horizontal steps with vertical transitions
+    // We compute an "erase-ahead" region in pixels and fade samples that fall inside it.
+    const last = buf[buf.length-1];
+    const xb_latest = X(last.t);
+    const gap = 8; // px gap in front of newest sample to keep visible
+    const eraseFull = 50; // fully erased region after the gap
+    const fadeEnd = 100;  // fade to opaque by this distance after the gap
+    const totalW = fadeEnd;
+    // helper: distance forward from xb_latest to x in pixels (0..W)
+    function distAheadPx(x){ let d = x - xb_latest; if (d < 0) d += W; return d; }
+    function alphaFromDist(d){ if (d <= gap + eraseFull) return 0; if (d >= gap + fadeEnd) return 1; return (d - (gap + eraseFull)) / (fadeEnd - eraseFull); }
     for(let i=1;i<buf.length;i++){
       const a = buf[i-1], b = buf[i]; const ta = a.t % WIN, tb = b.t % WIN;
       const xa = X(a.t), xb = X(b.t);
-      if (tb < ta){ // wrapped: draw a small dot at xb (data drawn on top of the background bar)
+      // wrapped: draw a small dot at xb
+      if (tb < ta){
         const r = Math.max(1, Math.min(3, Math.round(Math.max(1, Math.min(3, Math.floor(W/200))))));
-        ctx.fillStyle = cfg.color;
-        ctx.beginPath(); ctx.arc(xb, Y(b.v), r, 0, Math.PI*2); ctx.fill();
+        const d = distAheadPx(xb);
+        const alpha = alphaFromDist(d);
+        if (alpha > 0){ ctx.globalAlpha = alpha; ctx.fillStyle = cfg.color; ctx.beginPath(); ctx.arc(xb, Y(b.v), r, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha = 1; }
       } else {
+        // compute alpha for endpoints and use that to draw the segment (approximate)
+        const da = distAheadPx(xa), db = distAheadPx(xb);
+        const aa = alphaFromDist(da), ab = alphaFromDist(db);
+        const segAlpha = Math.max(aa, ab);
+        if (segAlpha <= 0) continue; // fully erased
+        ctx.globalAlpha = segAlpha;
         if (cfg.step){
           // horizontal segment at a.v from xa -> xb
           ctx.beginPath(); ctx.strokeStyle = cfg.color; ctx.moveTo(xa, Y(a.v)); ctx.lineTo(xb, Y(a.v)); ctx.stroke();
@@ -234,8 +234,64 @@ function makeStrip(id, cfg){ const c=$(id);
           // default linear interpolation
           ctx.beginPath(); ctx.strokeStyle = cfg.color; ctx.moveTo(xa, Y(a.v)); ctx.lineTo(xb, Y(b.v)); ctx.stroke();
         }
+        ctx.globalAlpha = 1;
       }
     }
+    // Erase a short region slightly in front of the newest sample so the head has a small gap
+    // before erasure. This creates the visual separation you requested.
+    try{
+      const last = buf[buf.length-1];
+      const xb_latest = X(last.t);
+      const gap = 8; // px gap in front of newest sample to keep visible
+      const eraseFull = 50; // fully erased region after the gap
+      const fadeEnd = 100;  // fade to transparent by this distance after the gap
+      const totalW = fadeEnd + 2; // small padding to avoid 1px seams
+
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      // draw erase region starting at xb_latest + gap
+      const start = Math.round(xb_latest + gap);
+      const s = ((start % W) + W) % W;
+      function drawSeg(px, w, segOffset){
+        // segOffset: distance from logical start (0..totalW)
+        const segLeft = segOffset;
+        const segRight = segOffset + w;
+        // fully erased portion relative to segment
+        const fullyLeft = 0;
+        const fullyRight = eraseFull;
+        // if nothing to erase in this seg
+        if (segRight <= fullyLeft) return;
+        if (segLeft >= fadeEnd) return;
+        // solid part
+        if (segLeft < fullyRight){
+          const left = Math.max(segLeft, fullyLeft);
+          const right = Math.min(segRight, fullyRight);
+          const pxL = Math.round(px + (left - segLeft));
+          const pxW = Math.round(right - left);
+          if (pxW>0) ctx.fillRect(pxL, 0, pxW, H);
+        }
+        // gradient part
+        const gradLeft = Math.max(segLeft, fullyRight);
+        const gradRight = Math.min(segRight, fadeEnd);
+        if (gradRight > gradLeft){
+          const pxL = Math.round(px + (gradLeft - segLeft));
+          const pxR = Math.round(px + (gradRight - segLeft));
+          const g = ctx.createLinearGradient(pxL,0,pxR,0);
+          g.addColorStop(0, 'rgba(0,0,0,1)');
+          g.addColorStop(1, 'rgba(0,0,0,0)');
+          ctx.fillStyle = g;
+          ctx.fillRect(pxL,0,pxR-pxL,H);
+        }
+      }
+      if (s + totalW <= W){
+        drawSeg(s, totalW, 0);
+      } else {
+        const w1 = W - s; const w2 = totalW - w1;
+        drawSeg(s, w1, 0);
+        drawSeg(0, w2, w1);
+      }
+      ctx.restore();
+    }catch(e){ /* safe: ignore erase if anything fails */ }
   }
   window.addEventListener('resize', ()=>{ lastW=0; lastH=0; render(); });
   // expose getSmoothed and setAlpha to allow numeric displays and remote control to read/update smoothing
@@ -353,10 +409,13 @@ es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; /
     // Blood pressure detection (client-side): record max ventricular pressure per valve segment
     if($('n-bp')){
       try{
-        const modeN = Number(d.mode);
-        const pausedN = Number(d.paused);
-        const valveN = Number(d.valve);
-        const vent = Number(d.vent_mmHg) || 0;
+  const modeN = Number(d.mode);
+  const pausedN = Number(d.paused);
+  const valveN = Number(d.valve);
+  // Use the same smoothed ventricle value that is shown in the UI numeric display
+  // (_dispVent is kept in sync with the strip smoothing). Fall back to raw server value
+  // if the smoothed display value isn't available.
+  const vent = (_dispVent != null) ? _dispVent : (Number(d.vent_mmHg) || 0);
         // Only run when in BEAT mode and unpaused
         if (modeN===2 && pausedN===0){
           if (bpState.lastValve === null){
