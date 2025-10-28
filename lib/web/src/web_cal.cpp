@@ -13,6 +13,7 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
   .box{border:1px solid #283241;border-radius:12px;padding:12px;margin-bottom:12px;background:#0e141b}
   table{width:100%;border-collapse:collapse} th,td{border:1px solid #283241;padding:6px;text-align:left}
   .muted{color:#9aa7b2}
+  #rawLog{height:220px;overflow:auto;border:1px solid #20303a;padding:8px;border-radius:8px;background:#071018;font-family:monospace;font-size:12px}
 </style>
 
 <h2>Calibration</h2>
@@ -23,6 +24,7 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
     <label>PWM (0..255)</label>
     <input id="pwm" type="number" min="0" max="255" value="0">
     <button onclick="setPwm()">Apply</button>
+    <button id="btnManualToggle" onclick="toggleManual()">Pause</button>
     <span id="pwmS" class="muted"></span>
   </div>
   <div class="row">
@@ -37,13 +39,21 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
   <h3>Capture</h3>
   <div class="row">
     <label>Channel</label>
-    <select id="ch"><option value="atr">Atrium</option><option value="vent">Ventricle</option><option value="flow">Flow</option></select>
-    <label>Avg N</label><input id="navg" type="number" value="25" min="1" max="500">
-    <label>Actual</label><input id="actual" type="number" step="0.01" value="0">
-    <button onclick="capture()">Capture</button>
+    <div id="chSel">
+      <label style="margin-right:8px"><input type="checkbox" data-ch="atr" checked> Atrium</label>
+      <label style="margin-right:8px"><input type="checkbox" data-ch="vent" checked> Ventricle</label>
+      <label style="margin-right:8px"><input type="checkbox" data-ch="flow"> Flow</label>
+    </div>
+    <label>Avg N</label><input id="navg" type="number" value="25" min="1">
+    <label>Actual mmHg</label><input id="actual_mmHg" type="number" step="0.01" value="0">
+    <label>Actual L/min</label><input id="actual_L_min" type="number" step="0.01" value="0">
+    <button id="btnCapture" onclick="capture()">Capture</button>
     <span id="capS" class="muted"></span>
   </div>
   <table id="tbl"><thead><tr><th>#</th><th>Channel</th><th>Raw</th><th>Actual</th></tr></thead><tbody></tbody></table>
+</div>
+<div style="margin-bottom:12px">
+  <div id="capProgress" style="height:10px;background:#071018;border:1px solid #20303a;border-radius:6px;overflow:hidden;width:100%"><div id="capBar" style="height:100%;width:0%;background:linear-gradient(90deg,#0ea5e9,#a78bfa)"></div></div>
 </div>
 
 <div class="box">
@@ -54,13 +64,37 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
     <button onclick="fit()">Fit</button>
     <span id="fitS" class="muted"></span>
   </div>
-  <div class="row">
-    <button onclick="apply()">Apply (runtime)</button>
-    <button onclick="save()">Save (NVS)</button>
-    <button onclick="load()">Load (NVS→runtime)</button>
-    <button onclick="defaults()">Defaults (runtime)</button>
+  <!-- removed per-channel Apply/Save/Load/Defaults buttons (not used) -->
+  <div class="box">
+    <h3>Calibration coefficients</h3>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <button id="applyAll">Apply All</button>
+      <button id="saveAll">Save All</button>
+      <button id="loadAll">Load NVS</button>
+      <button id="defaultsAll">Defaults</button>
+      <div style="flex:1"></div>
+      <span id="calS" class="muted"></span>
+    </div>
+    <table id="calTable" style="width:100%;border-collapse:collapse">
+      <thead><tr><th>Channel</th><th>Current m</th><th>Current b</th><th>Fitted m</th><th>Fitted b</th><th>σ</th><th>R²</th></tr></thead>
+      <tbody>
+        <tr id="cal-atr" data-ch="atr"><td>Atrium</td><td class="cur-m">-</td><td class="cur-b">-</td><td class="fit-m" contenteditable="true">-</td><td class="fit-b" contenteditable="true">-</td><td class="fit-s">-</td><td class="fit-r2">-</td></tr>
+        <tr id="cal-vent" data-ch="vent"><td>Ventricle</td><td class="cur-m">-</td><td class="cur-b">-</td><td class="fit-m" contenteditable="true">-</td><td class="fit-b" contenteditable="true">-</td><td class="fit-s">-</td><td class="fit-r2">-</td></tr>
+        <tr id="cal-flow" data-ch="flow"><td>Flow</td><td class="cur-m">-</td><td class="cur-b">-</td><td class="fit-m" contenteditable="true">-</td><td class="fit-b" contenteditable="true">-</td><td class="fit-s">-</td><td class="fit-r2">-</td></tr>
+      </tbody>
+    </table>
   </div>
-  <pre id="cur" class="muted"></pre>
+</div>
+
+<div class="box">
+  <h3>Raw stream</h3>
+  <div class="row">
+    <button id="clearRaw">Clear</button>
+    <div style="flex:1"></div>
+    <label class="muted">Auto-scroll</label>
+    <input id="autoScroll" type="checkbox" checked>
+  </div>
+  <div id="rawLog"></div>
 </div>
 
 <script>
@@ -82,16 +116,60 @@ async function setValve(v){
   document.getElementById('valS').textContent = r.ok ? 'ok' : 'error';
 }
 
+async function toggleManual(){
+  // toggle the main play/pause — use same API as the main UI
+  await fetch('/api/toggle').catch(()=>{});
+  // briefly indicate request sent
+  const b = document.getElementById('btnManualToggle'); if(!b) return; b.textContent='...'; setTimeout(()=>b.textContent='Pause', 600);
+}
+
 async function capture(){
-  const ch=document.getElementById('ch').value;
-  const n = Math.max(1, Math.min(1000, +document.getElementById('navg').value||25));
-  const act = +document.getElementById('actual').value||0;
-  const form = new URLSearchParams({ch, avgN:n, actual:act});
-  const r = await fetch('/api/cal/capture', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form});
-  if(!r.ok){ document.getElementById('capS').textContent='capture error'; return; }
-  const js = await r.json();
-  js.points.forEach(p=> addRow(ch, p.raw, p.actual));
-  document.getElementById('capS').textContent='captured';
+  // Client-side capture: sample values from the streaming SSE (calEs) so server is not blocked.
+  const chEls = Array.from(document.querySelectorAll('#chSel input[data-ch]'));
+  const channels = chEls.filter(e=>e.checked).map(e=>e.dataset.ch);
+  if (!channels.length){ document.getElementById('capS').textContent='select at least one channel'; return; }
+  const n = Math.max(1, Math.min(100000, +document.getElementById('navg').value||25));
+  const act_mmHg = +document.getElementById('actual_mmHg').value||0;
+  const act_L = +document.getElementById('actual_L_min').value||0;
+
+  const btn = document.getElementById('btnCapture'); if(btn) btn.disabled = true; document.getElementById('capS').textContent='capturing...';
+  const bar = document.getElementById('capBar'); if(bar) bar.style.width = '0%';
+
+  // prepare buffers for each channel
+  const bufs = {}; channels.forEach(c=> bufs[c]=[]);
+
+  // handler collects samples from calEs messages
+  const es = window.calEs;
+  if(!es){ document.getElementById('capS').textContent='no stream'; if(btn) btn.disabled=false; return; }
+
+  let collected = 0;
+  function onmsg(ev){
+    try{
+      const d = JSON.parse(ev.data);
+      channels.forEach(ch=>{
+        if (ch==='atr' && typeof d.atr_mmHg !== 'undefined') bufs[ch].push(Number(d.atr_mmHg));
+        else if (ch==='vent' && typeof d.vent_mmHg !== 'undefined') bufs[ch].push(Number(d.vent_mmHg));
+        else if (ch==='flow' && typeof d.flow_L_min !== 'undefined') bufs[ch].push(Number(d.flow_L_min));
+      });
+      // use the max length among channels as collected count
+      collected = Math.max(...channels.map(c=>bufs[c].length));
+      if(bar) bar.style.width = Math.min(100, Math.round((collected / n) * 100)) + '%';
+      if(collected >= n){
+        // done
+        es.removeEventListener('message', onmsg);
+        // compute averages and append rows
+        channels.forEach(ch=>{
+          const arr = bufs[ch];
+          if(!arr.length) return;
+          const sum = arr.reduce((s,v)=>s+v,0); const avg = sum/arr.length;
+          const actual = (ch==='flow')? act_L : act_mmHg;
+          addRow(ch, avg, actual);
+        });
+        document.getElementById('capS').textContent='captured'; if(btn) btn.disabled=false; if(bar) bar.style.width='100%';
+      }
+    }catch(e){ /* ignore parse errors */ }
+  }
+  es.addEventListener('message', onmsg);
 }
 
 function linfit(v){ // least squares on [{x, y}]
@@ -106,27 +184,126 @@ function linfit(v){ // least squares on [{x, y}]
 }
 
 async function fit(){
-  const ch=document.getElementById('fitCh').value;
-  // collect from server for exactness
-  const r = await fetch('/api/cal/list');
-  const js = await r.json(); const key = ch;
-  const pts = (js[key]||[]).map(p=>({x:p.raw, y:p.actual}));
+  // Use the captured table rows for fitting (client-side)
+  const ch = document.getElementById('fitCh').value;
+  // gather rows from capture table
+  const rows = Array.from(document.querySelectorAll('#tbl tbody tr'));
+  const pts = [];
+  for (const r of rows){
+    const tds = r.querySelectorAll('td');
+    if (!tds || tds.length < 4) continue;
+    const chName = tds[1].textContent.trim();
+    if (chName !== ch) continue;
+    const raw = parseFloat(tds[2].textContent);
+    const actual = parseFloat(tds[3].textContent);
+    if (!isNaN(raw) && !isNaN(actual)) pts.push({x: raw, y: actual});
+  }
+  if (pts.length < 2){
+    document.getElementById('fitS').textContent = 'need ≥2 captured points for fit';
+    return;
+  }
   const f = linfit(pts);
-  document.getElementById('fitS').textContent = `n=${f.n} m=${f.m.toFixed(6)} b=${f.b.toFixed(3)} r²=${f.r2.toFixed(4)}`;
-  // apply to runtime cache
-  const cur = await fetch('/api/cal/get'); const cj = await cur.json();
-  if (ch==='atr')  { cj.atr_m=f.m; cj.atr_b=f.b; }
-  if (ch==='vent') { cj.vent_m=f.m; cj.vent_b=f.b; }
-  if (ch==='flow') { cj.flow_m=f.m; cj.flow_b=f.b; }
-  await fetch('/api/cal/apply',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cj)});
-  updateCur();
+  // compute standard deviation of residuals (sample stddev)
+  let ss = 0;
+  for (const p of pts){ const yhat = f.m * p.x + f.b; ss += (p.y - yhat) * (p.y - yhat); }
+  const stddev = (pts.length>1) ? Math.sqrt(ss / (pts.length - 1)) : 0;
+  document.getElementById('fitS').textContent = `n=${f.n} m=${f.m.toFixed(6)} b=${f.b.toFixed(3)} r²=${f.r2.toFixed(4)} σ=${stddev.toFixed(3)}`;
+
+  // update the calibration table fitted cells for the channel and enable actions
+  function setFitted(chKey, m, b, s, r2){
+    const row = document.getElementById('cal-' + (chKey==='atr'?'atr':chKey==='vent'?'vent':'flow'));
+    if (!row) return;
+    row.querySelector('.fit-m').textContent = Number(m).toFixed(6);
+    row.querySelector('.fit-b').textContent = Number(b).toFixed(6);
+    row.querySelector('.fit-s').textContent = Number(s).toFixed(3);
+    row.querySelector('.fit-r2').textContent = Number(r2).toFixed(4);
+    // enable apply/save for this channel
+    const applyBtn = row.querySelector('.btn-apply'); const saveBtn = row.querySelector('.btn-save');
+    // fitted values populated; user may also edit the fitted m/b cells manually (contenteditable)
+  }
+  setFitted(ch, f.m, f.b, stddev, f.r2);
 }
-async function apply(){ const cur=await fetch('/api/cal/get'); const cj=await cur.json(); await fetch('/api/cal/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cj)}); updateCur(); }
-async function save(){ await fetch('/api/cal/save',{method:'POST'}); updateCur(); }
-async function load(){ await fetch('/api/cal/load',{method:'POST'}); updateCur(); }
-async function defaults(){ await fetch('/api/cal/defaults',{method:'POST'}); updateCur(); }
-async function updateCur(){ const r=await fetch('/api/cal/get'); const j = await r.json(); document.getElementById('cur').textContent = JSON.stringify(j,null,2); }
-updateCur();
+
+
+// Refresh current runtime coefficients into the calibration table
+async function refreshCalTable(){
+  try{
+    const r = await fetch('/api/cal/get'); const cur = await r.json();
+    // populate current columns
+    const mAtr = cur.atr_m || 0, bAtr = cur.atr_b || 0;
+    const mVent= cur.vent_m || 0, bVent= cur.vent_b || 0;
+    const mFlow= cur.flow_m || 0, bFlow= cur.flow_b || 0;
+    const setRow = (id,m,b)=>{
+      const row = document.getElementById('cal-'+id); if(!row) return;
+      row.querySelector('.cur-m').textContent = Number(m).toFixed(6);
+      row.querySelector('.cur-b').textContent = Number(b).toFixed(6);
+      // reset fitted cells and disable apply/save
+      row.querySelector('.fit-m').textContent = '-'; row.querySelector('.fit-b').textContent = '-'; row.querySelector('.fit-s').textContent = '-'; row.querySelector('.fit-r2').textContent = '-';
+      const applyBtn = row.querySelector('.btn-apply'); const saveBtn = row.querySelector('.btn-save'); if(applyBtn) applyBtn.disabled=true; if(saveBtn) saveBtn.disabled=true;
+    };
+    setRow('atr', mAtr, bAtr); setRow('vent', mVent, bVent); setRow('flow', mFlow, bFlow);
+    document.getElementById('calS').textContent = '';
+  }catch(e){ document.getElementById('calS').textContent = 'error refreshing'; }
+}
+refreshCalTable();
+
+
+
+// Global helpers
+async function applyAll(){
+  // copy fitted values (if any) into runtime for each channel, then apply once
+  const rcur = await fetch('/api/cal/get'); const cj = await rcur.json();
+  ['atr','vent','flow'].forEach(ch=>{
+    const row=document.getElementById('cal-'+ch); if(!row) return; const m=parseFloat(row.querySelector('.fit-m').textContent); const b=parseFloat(row.querySelector('.fit-b').textContent);
+    if(!isNaN(m) && !isNaN(b)){
+      if(ch==='atr'){ cj.atr_m=m; cj.atr_b=b; }
+      if(ch==='vent'){ cj.vent_m=m; cj.vent_b=b; }
+      if(ch==='flow'){ cj.flow_m=m; cj.flow_b=b; }
+    }
+  });
+  // server expects the payload as a form field named "plain" (see /api/cal/apply handler)
+  const payload = 'plain='+encodeURIComponent(JSON.stringify(cj));
+  await fetch('/api/cal/apply',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:payload});
+  document.getElementById('calS').textContent='applied all'; await refreshCalTable();
+}
+
+async function saveAll(){ await applyAll(); const r = await fetch('/api/cal/save',{method:'POST'}); document.getElementById('calS').textContent = r.ok? 'saved all':'save error'; }
+
+// Wire up button event listeners after DOM
+document.addEventListener('DOMContentLoaded', ()=>{
+  document.getElementById('applyAll').addEventListener('click', applyAll);
+  document.getElementById('saveAll').addEventListener('click', saveAll);
+  document.getElementById('loadAll').addEventListener('click', ()=>{ fetch('/api/cal/load',{method:'POST'}).then(()=>refreshCalTable()); });
+  document.getElementById('defaultsAll').addEventListener('click', ()=>{ fetch('/api/cal/defaults',{method:'POST'}).then(()=>refreshCalTable()); });
+  // per-row action buttons removed — users can edit fitted m/b cells manually, then use Apply All / Save All
+});
+
+// Shared SSE for the calibration page: expose calEs and latest parsed telemetry
+window.calEs = new EventSource('/stream');
+window.calLast = null; // last parsed JSON telemetry (if available)
+
+// Raw SSE stream viewer for calibration page — auto-scroll by default
+(function(){
+  const log = document.getElementById('rawLog'); const clearBtn = document.getElementById('clearRaw'); const auto = document.getElementById('autoScroll');
+  if(!log) return;
+  const es = window.calEs;
+  es.addEventListener('open', ()=>{});
+  es.addEventListener('error', ()=>{});
+  es.addEventListener('message', (ev)=>{
+    try{
+      // append raw text
+      const el = document.createElement('div'); el.textContent = new Date().toLocaleTimeString() + '  ' + ev.data;
+      el.style.padding='4px'; el.style.borderBottom='1px solid rgba(255,255,255,0.02)'; el.style.wordBreak='break-all';
+      log.appendChild(el);
+      while(log.children.length>2000) log.removeChild(log.firstChild);
+      if(auto && auto.checked) log.scrollTop = log.scrollHeight;
+
+      // try to parse JSON telemetry for use elsewhere (e.g., paused state, client-side capture)
+      try{ const d = JSON.parse(ev.data); window.calLast = d; const mb = document.getElementById('btnManualToggle'); if (mb && typeof d.paused !== 'undefined'){ mb.textContent = Number(d.paused)===0 ? 'Pause' : 'Play'; } }catch(e){}
+    }catch(e){ }
+  });
+  if(clearBtn) clearBtn.addEventListener('click', ()=> log.innerHTML='');
+})();
 </script>
 )HTML";
 
@@ -153,32 +330,48 @@ void web_cal_register(AsyncWebServer& srv, const CalHooks& H){
   });
 
   // Capture N raw samples → return averaged point(s)
-  srv.on("/api/cal/capture", HTTP_POST, [=](AsyncWebServerRequest* req){
-    if (!req->hasParam("ch", true) || !req->hasParam("avgN", true) || !req->hasParam("actual", true)){
-      req->send(400); return;
-    }
-    String ch = req->getParam("ch", true)->value();
-    int n = req->getParam("avgN", true)->value().toInt(); if (n<1) n=1; if (n>1000) n=1000;
-    float act = req->getParam("actual", true)->value().toFloat();
+    srv.on("/api/cal/capture", HTTP_POST, [=](AsyncWebServerRequest* req){
+      if (!req->hasParam("ch", true) || !req->hasParam("avgN", true)){
+        req->send(400); return;
+      }
+      String chs = req->getParam("ch", true)->value();
+      int n = req->getParam("avgN", true)->value().toInt(); if (n<1) n=1; if (n>10000) n=10000;
+      float act_mmHg = 0.0f; float act_L = 0.0f;
+      if (req->hasParam("actual_mmHg", true)) act_mmHg = req->getParam("actual_mmHg", true)->value().toFloat();
+      if (req->hasParam("actual_L_min", true)) act_L = req->getParam("actual_L_min", true)->value().toFloat();
 
-    auto avgN = [&](std::function<float(void)> fn)->float{
-      double acc=0; for (int i=0;i<n;i++){ acc+=fn(); delay(2); } return (float)(acc/n);
-    };
+      auto avgN = [&](std::function<float(void)> fn)->float{
+        double acc=0; for (int i=0;i<n;i++){ acc+=fn(); delay(2); } return (float)(acc/n);
+      };
 
-    String out = "{\"points\":[";
-    if (ch=="atr" && H.read_atr_raw){
-      float raw = avgN([&]{ return (float)H.read_atr_raw(); });
-      out += String("{\"raw\":")+raw+",\"actual\":"+act+"}";
-    } else if (ch=="vent" && H.read_vent_raw){
-      float raw = avgN([&]{ return (float)H.read_vent_raw(); });
-      out += String("{\"raw\":")+raw+",\"actual\":"+act+"}";
-    } else if (ch=="flow" && H.read_flow_hz){
-      float rawHz = avgN([&]{ return H.read_flow_hz(); });
-      out += String("{\"raw\":")+rawHz+",\"actual\":"+act+"}";
-    } else { req->send(400); return; }
-    out += "]}";
-    req->send(200, "application/json", out);
-  });
+      String out = "{\"points\": [";
+      bool first = true;
+      int start = 0;
+      while (start <= chs.length()){
+        int comma = chs.indexOf(',', start);
+        String ch = (comma == -1) ? chs.substring(start) : chs.substring(start, comma);
+        ch.trim();
+        if (ch.length()){
+          if (!first) out += ",";
+          if (ch=="atr" && H.read_atr_raw){
+            float raw = avgN([&]{ return (float)H.read_atr_raw(); });
+            out += String("{\"ch\":\"atr\",\"raw\":") + raw + ",\"actual\":" + act_mmHg + "}";
+          } else if (ch=="vent" && H.read_vent_raw){
+            float raw = avgN([&]{ return (float)H.read_vent_raw(); });
+            out += String("{\"ch\":\"vent\",\"raw\":") + raw + ",\"actual\":" + act_mmHg + "}";
+          } else if (ch=="flow" && H.read_flow_hz){
+            float rawHz = avgN([&]{ return H.read_flow_hz(); });
+            out += String("{\"ch\":\"flow\",\"raw\":") + rawHz + ",\"actual\":" + act_L + "}";
+          } else {
+            // unknown channel requested: skip
+          }
+          first = false;
+        }
+        if (comma == -1) break; start = comma + 1;
+      }
+      out += "]}";
+      req->send(200, "application/json", out);
+    });
 
   // Calibration state get/apply/save/load/defaults
   srv.on("/api/cal/get", HTTP_GET, [=](AsyncWebServerRequest* req){

@@ -138,7 +138,7 @@ const $ = id => document.getElementById(id);
 try{ if($('ip')) $('ip').textContent = location.host || '192.168.4.1'; }catch(e){}
 
 function fitCanvas(c, ctx){ const w=c.clientWidth|0, h=c.clientHeight|0; if(c.width!==w||c.height!==h){ c.width=w; c.height=h; } ctx.setTransform(1,0,0,1,0,0); }
-function drawGrid(ctx,W,H){ ctx.save(); ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--grid').trim()||'#26303a'; ctx.lineWidth=1; ctx.beginPath(); for(let x=0;x<=W;x+=W/5){ ctx.moveTo(x+0.5,0); ctx.lineTo(x+0.5,H); } for(let y=0;y<=H;y+=H/4){ ctx.moveTo(0,y+0.5); ctx.lineTo(W,y+0.5); } ctx.stroke(); ctx.restore(); }
+function drawGrid(ctx,W,H){ /* grid disabled: no-op to remove background grid lines */ }
 
 function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]; const WIN=5.0;
   let lastW=0, lastH=0;
@@ -152,8 +152,10 @@ function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]
     const X = t => ((t % WIN) / WIN) * W;
     const Y = v => H - ((Math.max(cfg.min,Math.min(cfg.max,v)) - cfg.min)/(cfg.max-cfg.min)) * H;
     ctx.lineWidth = 2; ctx.strokeStyle = cfg.color; ctx.globalAlpha = 1; ctx.lineJoin='round'; ctx.lineCap='round';
-    // draw a background-colored vertical bar centered at the newest sample X so it moves with the data
-    const bg = (getComputedStyle(document.documentElement).getPropertyValue('--bg')||'#0b0f13').trim();
+  // draw a background-colored vertical bar centered at the newest sample X so it moves with the data
+  // Use the canvas's own background color when available so the refresh bar exactly matches the graph background
+  const canvasBg = getComputedStyle(c).backgroundColor || null;
+  const bg = (canvasBg && canvasBg.trim()) || (getComputedStyle(document.documentElement).getPropertyValue('--bg')||'#0b0f13').trim();
     const last = buf[buf.length-1];
     const xb_latest = X(last.t);
   const barW = 100;
