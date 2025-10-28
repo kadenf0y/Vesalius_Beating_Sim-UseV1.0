@@ -75,6 +75,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div style="flex:1"></div>
     <div class="pill">FPS: <b id="fps">—</b></div>
     <div class="pill">Loop: <b id="loop">—</b></div>
+    <div class="pill">JIT: <b id="jit">—</b></div>
   </div>
 
   <div class="main">
@@ -141,22 +142,49 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 const $ = id => document.getElementById(id);
 try{ if($('ip')) $('ip').textContent = location.host || '192.168.4.1'; }catch(e){}
 
+// Create SSE connection early so the top-level SSE status (SSE: INIT → OPEN/ERR)
+// updates even if a later script error would otherwise abort execution.
+// If EventSource construction fails, provide a safe fallback object so code
+// that assigns handlers or references `es` won't throw.
+let es = null;
+try{
+  es = new EventSource('/stream');
+  es.onopen = ()=>{ try{ if($('sse')) $('sse').textContent='OPEN'; }catch(e){} };
+  es.onerror = ()=>{ try{ if($('sse')) $('sse').textContent='ERR'; }catch(e){} };
+}catch(e){
+  // fallback no-op EventSource-like object
+  es = { onopen:null, onerror:null, onmessage:null, close:()=>{} };
+  try{ if($('sse')) $('sse').textContent='ERR'; }catch(e){}
+}
+
 function fitCanvas(c, ctx){ const w=c.clientWidth|0, h=c.clientHeight|0; if(c.width!==w||c.height!==h){ c.width=w; c.height=h; } ctx.setTransform(1,0,0,1,0,0); }
 function drawGrid(ctx,W,H){ /* grid disabled: no-op to remove background grid lines */ }
 
-function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]; const WIN=5.0;
+function makeStrip(id, cfg){ const c=$(id);
+  // guard: if the canvas element is missing or getContext fails, return a no-op
+  // strip so the rest of the UI can still function without throwing.
+  if (!c){
+    const noop = ()=>{};
+    return { push: noop, render: noop, getSmoothed: ()=>null, setAlpha: noop };
+  }
+  const ctx = c.getContext && c.getContext('2d'); if(!ctx){ const noop = ()=>{}; return { push: noop, render: noop, getSmoothed: ()=>null, setAlpha: noop }; }
+  const buf=[]; const WIN=5.0;
   let lastW=0, lastH=0;
   // optional smoothing: cfg.smoothAlpha in (0..1], higher -> more responsive, lower -> smoother
   let _prevSmoothed = null;
   let _alpha = (typeof cfg.smoothAlpha === 'number') ? Math.max(0, Math.min(1, cfg.smoothAlpha)) : 1.0;
-  function push(v){ const t=performance.now()/1000;
+  // push value into the strip. Optional second argument `tIn` can supply
+  // a server-origin timestamp in seconds; if not provided we fall back to
+  // the client's performance.now() time. Using server timestamps reduces
+  // visual jitter caused by network/browser delivery delays.
+  function push(v, tIn){ const t = (typeof tIn === 'number') ? tIn : (performance.now()/1000);
     let outV = v;
     if (_alpha < 1.0){
       if (_prevSmoothed === null) _prevSmoothed = outV;
       else _prevSmoothed = (_prevSmoothed * (1 - _alpha)) + (outV * _alpha);
       outV = _prevSmoothed;
     }
-    buf.push({t,v:outV}); while(buf.length && (performance.now()/1000 - buf[0].t)>WIN) buf.shift(); render(); }
+    buf.push({t,v:outV}); while(buf.length && (t - buf[0].t) > WIN) buf.shift(); requestStripRender(); }
   function render(){ fitCanvas(c,ctx); const W=c.width,H=c.height;
     // if resized, clear and redraw background grid
     if (W!==lastW || H!==lastH){ ctx.clearRect(0,0,W,H); drawGrid(ctx,W,H); lastW=W; lastH=H; }
@@ -188,7 +216,7 @@ function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]
       ctx.fillRect(0, 0, w2, H);
     }
 
-    // draw segments, but don't connect across wrap boundaries; when wrapping, draw a small dot at wrapped X
+    // draw segments. If cfg.step is true, render as horizontal steps with vertical transitions
     for(let i=1;i<buf.length;i++){
       const a = buf[i-1], b = buf[i]; const ta = a.t % WIN, tb = b.t % WIN;
       const xa = X(a.t), xb = X(b.t);
@@ -197,7 +225,15 @@ function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]
         ctx.fillStyle = cfg.color;
         ctx.beginPath(); ctx.arc(xb, Y(b.v), r, 0, Math.PI*2); ctx.fill();
       } else {
-        ctx.beginPath(); ctx.strokeStyle = cfg.color; ctx.moveTo(xa, Y(a.v)); ctx.lineTo(xb, Y(b.v)); ctx.stroke();
+        if (cfg.step){
+          // horizontal segment at a.v from xa -> xb
+          ctx.beginPath(); ctx.strokeStyle = cfg.color; ctx.moveTo(xa, Y(a.v)); ctx.lineTo(xb, Y(a.v)); ctx.stroke();
+          // vertical transition at xb from a.v -> b.v
+          ctx.beginPath(); ctx.moveTo(xb, Y(a.v)); ctx.lineTo(xb, Y(b.v)); ctx.stroke();
+        } else {
+          // default linear interpolation
+          ctx.beginPath(); ctx.strokeStyle = cfg.color; ctx.moveTo(xa, Y(a.v)); ctx.lineTo(xb, Y(b.v)); ctx.stroke();
+        }
       }
     }
   }
@@ -212,8 +248,16 @@ function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]
 const sAtr = makeStrip('cv-atr',{min:-5,max:205,color:'#0ea5e9', smoothAlpha:0.1});
 const sVent= makeStrip('cv-vent',{min:-5,max:205,color:'#ef4444', smoothAlpha:0.1});
 const sFlow= makeStrip('cv-flow',{min:0,max:7.5,color:'#f59e0b', smoothAlpha:0.25});
-const sValve=makeStrip('cv-valve',{min:0,max:1,color:'#22c55e'});
-const sPwm = makeStrip('cv-pwm',{min:0,max:255,color:'#a78bfa'});
+const sValve=makeStrip('cv-valve',{min:0,max:1,color:'#22c55e', step:true});
+// PWM should display actual hardware values (no client-side smoothing)
+const sPwm = makeStrip('cv-pwm',{min:0,max:255,color:'#a78bfa', step:true});
+
+// Centralized render request: schedule a single rAF to render all strips. This
+// avoids multiple paints per incoming SSE message (we update several strips
+// per message). Also use this loop to compute a render-based FPS metric.
+let _stripRenderScheduled = false;
+let _renderLast = performance.now(); let _renderEma = 0;
+function requestStripRender(){ if(!_stripRenderScheduled){ _stripRenderScheduled = true; requestAnimationFrame((ts)=>{ _stripRenderScheduled = false; const now = performance.now(); const dt = now - _renderLast; _renderLast = now; const fps = 1000/Math.max(1, dt); _renderEma = _renderEma ? (_renderEma * 0.9 + fps * 0.1) : fps; if($('fps')) $('fps').textContent = Math.round(_renderEma); sAtr.render(); sVent.render(); sFlow.render(); sValve.render(); sPwm.render(); }); } }
 
 function setNum(id,v,fix){ if(!$(id)) return; $(id).textContent = (v==null)?'—':(fix!=null?Number(v).toFixed(fix):v); }
 
@@ -241,20 +285,47 @@ function adjustPwm(d){ const el=$('pwmIn'); if(!el) return; let v=Number(el.valu
 function adjustBpm(d){ const el=$('bpmIn'); if(!el) return; let v=Number(el.value||0); v = Math.max(1, Math.min(60, v + d)); el.value = v; post('/api/bpm?b='+v); }
 
 // SSE receiver — uses server keys: atr_mmHg, vent_mmHg, flow_L_min, pwmSet, pwm, valve, mode, bpm, loopMs
-const es = new EventSource('/stream'); let last=performance.now(), ema=0;
+let last=performance.now(), ema=0;
+// diagnostics: rolling arrays for arrival/server intervals and skew (ms)
+const _sseArr = []; const _sseSrv = []; const _sseSkew = []; let _lastServerTs = null; let _sseOffset = null;
+// Map wall-clock epoch (Date.now) to performance.now timeline so server
+// timestamps (millis) can be converted to performance.now() seconds safely.
+const _perfEpoch = Date.now() - performance.now();
+function stats(a){ if(!a||!a.length) return {n:0,mean:0,sd:0,max:0}; let n=a.length; let sum=0, sumsq=0, max=0; for(const v of a){ sum+=v; sumsq+=v*v; if(v>max) max=v; } const mean=sum/n; const variance = Math.max(0, (sumsq - (sum*sum)/n)/n); return {n,mean,sd:Math.sqrt(variance),max}; }
 // persistent numeric-display EMAs to avoid jitter and ensure they follow strip smoothing
 let _dispAtr = null, _dispVent = null, _dispFlow = null;
 // Blood-pressure detection state (client-side): collect max vent per valve segment
 const bpState = { lastValve: null, curMaxVent: null, systolic: null, diastolic: null, lastDisplay: null };
 es.onopen=()=>$('sse')? $('sse').textContent='OPEN' : null; es.onerror=()=>$('sse')? $('sse').textContent='ERR' : null;
-es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; const fps=1000/Math.max(1,dt); ema= ema? (ema*0.98 + fps*0.02) : fps; if($('fps')) $('fps').textContent=Math.round(ema);
+es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; // arrival dt used for diagnostics only; render FPS is measured by rAF
   try{ const d=JSON.parse(ev.data);
+    // diagnostics: record client arrival delta and server-reported interval (if present)
+    _sseArr.push(dt); if(_sseArr.length>200) _sseArr.shift();
+    if (typeof d.tsMs !== 'undefined'){
+      const srv = Number(d.tsMs);
+      if (_lastServerTs !== null){ _sseSrv.push(srv - _lastServerTs); if(_sseSrv.length>200) _sseSrv.shift(); }
+      _lastServerTs = srv;
+      if (_sseOffset === null) _sseOffset = Date.now() - srv; // map server millis() -> client epoch
+      const skew = Date.now() - (srv + _sseOffset);
+      _sseSkew.push(skew); if(_sseSkew.length>200) _sseSkew.shift();
+    }
+    // update diagnostic pill
+    try{ const a=stats(_sseArr), s=stats(_sseSrv), k=stats(_sseSkew); if($('jit')) $('jit').textContent = `${Math.round(a.mean)}ms\u00B1${Math.round(a.sd)} srv${Math.round(s.mean)}ms skew${Math.round(k.mean)}ms`; }catch(e){}
   // push raw scaled values into strips (they will apply configured smoothing)
   const atrRawScaled = Number(d.atr_mmHg) || 0;
   const ventRawScaled = Number(d.vent_mmHg) || 0;
   const flowRawScaled = Number(d.flow_L_min) || 0;
-  sAtr.push(atrRawScaled); sVent.push(ventRawScaled); sFlow.push(flowRawScaled);
-  sValve.push(d.valve?1:0); sPwm.push(Number(d.pwm)||0);
+  // prefer server timestamp for X mapping when available to reduce arrival jitter
+  let srvPerfSec = null;
+  if (typeof d.tsMs !== 'undefined'){
+    const srv = Number(d.tsMs);
+    // compute server -> client epoch offset if not initialized
+    if (_sseOffset === null) _sseOffset = Date.now() - srv; // map server millis -> client epoch ms
+    // convert to performance.now() seconds: perf = (srv + offset - perfEpoch)/1000
+    srvPerfSec = (srv + _sseOffset - _perfEpoch) / 1000.0;
+  }
+  sAtr.push(atrRawScaled, srvPerfSec); sVent.push(ventRawScaled, srvPerfSec); sFlow.push(flowRawScaled, srvPerfSec);
+  sValve.push(d.valve?1:0, srvPerfSec); sPwm.push(Number(d.pwm)||0, srvPerfSec);
       // If server provided smoothing settings, apply them to the strips so the smoothing is in sync
       try{ if (d.smooth){ if (sAtr.setAlpha) sAtr.setAlpha(Number(d.smooth.atr) || 0); if (sVent.setAlpha) sVent.setAlpha(Number(d.smooth.vent) || 0); if (sFlow.setAlpha) sFlow.setAlpha(Number(d.smooth.flow) || 0); } }catch(e){}
   // For numeric displays, prefer the smoothed value from the strip if available; apply a small EMA here
@@ -274,7 +345,10 @@ es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; c
   _dispVent = (_dispVent * (1 - alpha_ventraw)) + (sVentVal * alpha_ventraw);
   _dispFlow = (_dispFlow * (1 - alpha_flowraw)) + (sFlowVal * alpha_flowraw);
   // Round atrium and ventricle displays to nearest integer (pressure values)
-  setNum('n-atr', Math.round(_dispAtr), 0); setNum('n-vent', Math.round(_dispVent), 0); setNum('n-flow', _dispFlow, 2); setNum('n-pwm', d.pwm,0);
+  setNum('n-atr', Math.round(_dispAtr), 0); setNum('n-vent', Math.round(_dispVent), 0); setNum('n-flow', _dispFlow, 2);
+  // For PWM numeric display prefer the strip's smoothed value (if available)
+  // Display the actual PWM value from the server (do not use client smoothing)
+  setNum('n-pwm', Number(d.pwm) || 0, 0);
     if($('n-valve')) $('n-valve').textContent = d.valve? '▲' : '▼';
     // Blood pressure detection (client-side): record max ventricular pressure per valve segment
     if($('n-bp')){
@@ -400,13 +474,15 @@ static void sse_task(void*){
         "{\"mode\":%d,\"paused\":%d,\"pwmSet\":%d,\"pwm\":%d,\"valve\":%d,\"bpm\":%d,\"loopMs\":%.3f,"
         "\"atr_mmHg\":%.3f,\"vent_mmHg\":%.3f,\"flow_L_min\":%.3f,"
         "\"atr_raw\":%d,\"vent_raw\":%d,\"flow_hz\":%.3f,"
-        "\"cal\":{\"atr_m\":%.6f,\"atr_b\":%.6f,\"vent_m\":%.6f,\"vent_b\":%.6f,\"flow_m\":%.6f,\"flow_b\":%.6f},"
-        "\"smooth\":{\"atr\":%.3f,\"vent\":%.3f,\"flow\":%.3f}}",
+  "\"cal\":{\"atr_m\":%.6f,\"atr_b\":%.6f,\"vent_m\":%.6f,\"vent_b\":%.6f,\"flow_m\":%.6f,\"flow_b\":%.6f},"
+  "\"tsMs\":%lu,"
+  "\"smooth\":{\"atr\":%.3f,\"vent\":%.3f,\"flow\":%.3f}}",
         mode, paused, pwmSet, pwm, valve, bpm, loop,
         atr, ven, fl,
         G.atr_raw.load(), G.vent_raw.load(), G.flow_hz.load(),
         G.atr_m.load(), G.atr_b.load(), G.vent_m.load(), G.vent_b.load(), G.flow_m.load(), G.flow_b.load(),
-        (double)g_smooth_atr, (double)g_smooth_vent, (double)g_smooth_flow);
+  (unsigned long)millis(),
+  (double)g_smooth_atr, (double)g_smooth_vent, (double)g_smooth_flow);
     if (n>0) sse.send(buf, "message", millis());
     vTaskDelayUntil(&wake, per);
   }
