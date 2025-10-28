@@ -22,7 +22,7 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
   <h3>Manual outputs (3 s override)</h3>
   <div class="row">
     <label>PWM (0..255)</label>
-    <input id="pwm" type="number" min="0" max="255" value="0">
+    <input id="pwm" type="number" min="0" max="255" value="180">
     <button onclick="setPwm()">Apply</button>
     <button id="btnManualToggle" onclick="toggleManual()">Pause</button>
     <span id="pwmS" class="muted"></span>
@@ -84,6 +84,30 @@ static const char CAL_HTML[] PROGMEM = R"HTML(
         <tr id="cal-flow" data-ch="flow"><td>Flow</td><td class="cur-m">-</td><td class="cur-b">-</td><td class="fit-m" contenteditable="true">-</td><td class="fit-b" contenteditable="true">-</td><td class="fit-s">-</td><td class="fit-r2">-</td></tr>
       </tbody>
     </table>
+  </div>
+</div>
+
+<div class="box">
+  <h3>Smoothing (graphs)</h3>
+  <div class="row">
+    <label style="min-width:100px">Atrium</label>
+    <input id="smooth_atr" type="range" min="0" max="1" step="0.01" value="0.15" style="flex:1">
+    <input id="smooth_atr_val" type="number" min="0" max="1" step="0.01" value="0.15" style="width:72px;margin-left:8px">
+  </div>
+  <div class="row">
+    <label style="min-width:100px">Ventricle</label>
+    <input id="smooth_vent" type="range" min="0" max="1" step="0.01" value="0.15" style="flex:1">
+    <input id="smooth_vent_val" type="number" min="0" max="1" step="0.01" value="0.15" style="width:72px;margin-left:8px">
+  </div>
+  <div class="row">
+    <label style="min-width:100px">Flow</label>
+    <input id="smooth_flow" type="range" min="0" max="1" step="0.01" value="0.20" style="flex:1">
+    <input id="smooth_flow_val" type="number" min="0" max="1" step="0.01" value="0.20" style="width:72px;margin-left:8px">
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnSetSmooth">Set Smoothing</button>
+    <div style="flex:1"></div>
+    <span id="smoothS" class="muted"></span>
   </div>
 </div>
 
@@ -367,7 +391,18 @@ window.calLast = null; // last parsed JSON telemetry (if available)
       if(auto && auto.checked) log.scrollTop = log.scrollHeight;
 
       // try to parse JSON telemetry for use elsewhere (e.g., paused state, client-side capture)
-      try{ const d = JSON.parse(ev.data); window.calLast = d; const mb = document.getElementById('btnManualToggle'); if (mb && typeof d.paused !== 'undefined'){ mb.textContent = Number(d.paused)===0 ? 'Pause' : 'Play'; } }catch(e){}
+      try{ const d = JSON.parse(ev.data); window.calLast = d; const mb = document.getElementById('btnManualToggle'); if (mb && typeof d.paused !== 'undefined'){ mb.textContent = Number(d.paused)===0 ? 'Pause' : 'Play'; }
+        // if smoothing settings present in SSE, populate controls only once on first message
+        try{
+          if (d.smooth && !window._smoothInit){
+            window._smoothInit = true;
+            const sa = Number(d.smooth.atr)||0; const sv = Number(d.smooth.vent)||0; const sf = Number(d.smooth.flow)||0;
+            const iA = document.getElementById('smooth_atr'), iAv = document.getElementById('smooth_atr_val'); if(iA && iAv){ iA.value = sa; iAv.value = sa; }
+            const iV = document.getElementById('smooth_vent'), iVv = document.getElementById('smooth_vent_val'); if(iV && iVv){ iV.value = sv; iVv.value = sv; }
+            const iF = document.getElementById('smooth_flow'), iFv = document.getElementById('smooth_flow_val'); if(iF && iFv){ iF.value = sf; iFv.value = sf; }
+          }
+        }catch(e){}
+      }catch(e){}
     }catch(e){ }
   });
   if(clearBtn) clearBtn.addEventListener('click', ()=> log.innerHTML='');
@@ -384,6 +419,40 @@ window.calLast = null; // last parsed JSON telemetry (if available)
     }catch(e){}
   };
   if(clearBtn) clearBtn.addEventListener('click', ()=> out.innerHTML='');
+})();
+// smoothing control wiring
+(function(){
+  const sa = document.getElementById('smooth_atr'); const sav = document.getElementById('smooth_atr_val');
+  const sv = document.getElementById('smooth_vent'); const svv = document.getElementById('smooth_vent_val');
+  const sf = document.getElementById('smooth_flow'); const sfv = document.getElementById('smooth_flow_val');
+  const btn = document.getElementById('btnSetSmooth'); const status = document.getElementById('smoothS');
+  if(!btn) return;
+  // keep range and number inputs in sync and auto-send smoothing changes (debounced)
+  function link(r,n){ if(!r||!n) return; r.addEventListener('input', ()=> n.value = r.value); n.addEventListener('change', ()=> r.value = n.value); }
+  link(sa,sav); link(sv,svv); link(sf,sfv);
+  let smoothTimer = null;
+  async function sendSmoothOnce(){
+    const a = Number(sa.value||0); const v = Number(sv.value||0); const f = Number(sf.value||0);
+    const qs = `atr=${encodeURIComponent(String(a))}&vent=${encodeURIComponent(String(v))}&flow=${encodeURIComponent(String(f))}`;
+    try{
+      if(window.logOut) window.logOut('GET /api/smooth?'+qs);
+      const r = await fetch('/api/smooth?'+qs);
+      if(window.logOut) window.logOut('=> /api/smooth ' + (r.ok? 'OK' : ('ERR '+r.status)));
+      status.textContent = r.ok? 'ok' : 'error';
+    }catch(e){ status.textContent = 'err'; if(window.logOut) window.logOut('ERR /api/smooth'); }
+    setTimeout(()=> status.textContent = '', 1200);
+  }
+  function scheduleSmooth(){ if(smoothTimer) clearTimeout(smoothTimer); smoothTimer = setTimeout(()=>{ smoothTimer = null; sendSmoothOnce(); }, 200); }
+  // auto-send while user interacts
+  sa.addEventListener('input', ()=>{ sav.value = sa.value; scheduleSmooth(); });
+  sv.addEventListener('input', ()=>{ svv.value = sv.value; scheduleSmooth(); });
+  sf.addEventListener('input', ()=>{ sfv.value = sf.value; scheduleSmooth(); });
+  // number input changes also schedule send
+  sav.addEventListener('change', ()=>{ sa.value = sav.value; scheduleSmooth(); });
+  svv.addEventListener('change', ()=>{ sv.value = svv.value; scheduleSmooth(); });
+  sfv.addEventListener('change', ()=>{ sf.value = sfv.value; scheduleSmooth(); });
+  // keep explicit Set Smoothing button for manual send
+  btn.addEventListener('click', sendSmoothOnce);
 })();
 </script>
 )HTML";

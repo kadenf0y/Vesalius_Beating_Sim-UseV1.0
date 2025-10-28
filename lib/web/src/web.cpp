@@ -20,6 +20,10 @@
 
 static AsyncWebServer server(kHttpPort);
 static AsyncEventSource sse("/stream");
+// Live smoothing settings (default values)
+static float g_smooth_atr = 0.15f;
+static float g_smooth_vent = 0.15f;
+static float g_smooth_flow = 0.20f;
 
 // ---- UI (inline HTML served from flash) ----
 static const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -108,7 +112,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
           <div style="display:flex;flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
             <div style="display:flex;flex-direction:column;align-items:stretch;width:100%;gap:6px">
               <button id="btnPwmPlus" class="btn btn-full btn-power">+5</button>
-              <input id="pwmIn" type="number" min="0" max="255" value="0" style="width:72px;align-self:center;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
+              <input id="pwmIn" type="number" min="0" max="255" value="180" style="width:72px;align-self:center;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
               <button id="btnPwmMinus" class="btn btn-full btn-power">-5</button>
             </div>
             <div style="flex:1;min-width:8px"></div>
@@ -142,7 +146,17 @@ function drawGrid(ctx,W,H){ /* grid disabled: no-op to remove background grid li
 
 function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]; const WIN=5.0;
   let lastW=0, lastH=0;
-  function push(v){ const t=performance.now()/1000; buf.push({t,v}); while(buf.length && (performance.now()/1000 - buf[0].t)>WIN) buf.shift(); render(); }
+  // optional smoothing: cfg.smoothAlpha in (0..1], higher -> more responsive, lower -> smoother
+  let _prevSmoothed = null;
+  let _alpha = (typeof cfg.smoothAlpha === 'number') ? Math.max(0, Math.min(1, cfg.smoothAlpha)) : 1.0;
+  function push(v){ const t=performance.now()/1000;
+    let outV = v;
+    if (_alpha < 1.0){
+      if (_prevSmoothed === null) _prevSmoothed = outV;
+      else _prevSmoothed = (_prevSmoothed * (1 - _alpha)) + (outV * _alpha);
+      outV = _prevSmoothed;
+    }
+    buf.push({t,v:outV}); while(buf.length && (performance.now()/1000 - buf[0].t)>WIN) buf.shift(); render(); }
   function render(){ fitCanvas(c,ctx); const W=c.width,H=c.height;
     // if resized, clear and redraw background grid
     if (W!==lastW || H!==lastH){ ctx.clearRect(0,0,W,H); drawGrid(ctx,W,H); lastW=W; lastH=H; }
@@ -187,11 +201,17 @@ function makeStrip(id, cfg){ const c=$(id), ctx=c.getContext('2d'); const buf=[]
       }
     }
   }
-  window.addEventListener('resize', ()=>{ lastW=0; lastH=0; render(); }); return { push, render }; }
+  window.addEventListener('resize', ()=>{ lastW=0; lastH=0; render(); });
+  // expose getSmoothed and setAlpha to allow numeric displays and remote control to read/update smoothing
+  function getSmoothed(){ return _prevSmoothed; }
+  function setAlpha(a){ if (typeof a === 'number'){ _alpha = Math.max(0, Math.min(1, a)); } }
+  return { push, render, getSmoothed, setAlpha }; }
 
-const sAtr = makeStrip('cv-atr',{min:-5,max:205,color:'#0ea5e9'});
-const sVent= makeStrip('cv-vent',{min:-5,max:205,color:'#ef4444'});
-const sFlow= makeStrip('cv-flow',{min:0,max:7.5,color:'#f59e0b'});
+// Apply light exponential smoothing to physiological traces so they look less noisy
+// but remain responsive. Tunable via smoothAlpha (0..1). Lower = smoother, Higher = more responsive.
+const sAtr = makeStrip('cv-atr',{min:-5,max:205,color:'#0ea5e9', smoothAlpha:0.1});
+const sVent= makeStrip('cv-vent',{min:-5,max:205,color:'#ef4444', smoothAlpha:0.1});
+const sFlow= makeStrip('cv-flow',{min:0,max:7.5,color:'#f59e0b', smoothAlpha:0.25});
 const sValve=makeStrip('cv-valve',{min:0,max:1,color:'#22c55e'});
 const sPwm = makeStrip('cv-pwm',{min:0,max:255,color:'#a78bfa'});
 
@@ -222,14 +242,39 @@ function adjustBpm(d){ const el=$('bpmIn'); if(!el) return; let v=Number(el.valu
 
 // SSE receiver — uses server keys: atr_mmHg, vent_mmHg, flow_L_min, pwmSet, pwm, valve, mode, bpm, loopMs
 const es = new EventSource('/stream'); let last=performance.now(), ema=0;
+// persistent numeric-display EMAs to avoid jitter and ensure they follow strip smoothing
+let _dispAtr = null, _dispVent = null, _dispFlow = null;
 // Blood-pressure detection state (client-side): collect max vent per valve segment
 const bpState = { lastValve: null, curMaxVent: null, systolic: null, diastolic: null, lastDisplay: null };
 es.onopen=()=>$('sse')? $('sse').textContent='OPEN' : null; es.onerror=()=>$('sse')? $('sse').textContent='ERR' : null;
 es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; const fps=1000/Math.max(1,dt); ema= ema? (ema*0.98 + fps*0.02) : fps; if($('fps')) $('fps').textContent=Math.round(ema);
   try{ const d=JSON.parse(ev.data);
-  sAtr.push(Number(d.atr_mmHg)||0); sVent.push(Number(d.vent_mmHg)||0); sFlow.push(Number(d.flow_L_min)||0);
+  // push raw scaled values into strips (they will apply configured smoothing)
+  const atrRawScaled = Number(d.atr_mmHg) || 0;
+  const ventRawScaled = Number(d.vent_mmHg) || 0;
+  const flowRawScaled = Number(d.flow_L_min) || 0;
+  sAtr.push(atrRawScaled); sVent.push(ventRawScaled); sFlow.push(flowRawScaled);
   sValve.push(d.valve?1:0); sPwm.push(Number(d.pwm)||0);
-    setNum('n-atr', d.atr_mmHg, 1); setNum('n-vent', d.vent_mmHg, 1); setNum('n-flow', d.flow_L_min, 2); setNum('n-pwm', d.pwm,0);
+      // If server provided smoothing settings, apply them to the strips so the smoothing is in sync
+      try{ if (d.smooth){ if (sAtr.setAlpha) sAtr.setAlpha(Number(d.smooth.atr) || 0); if (sVent.setAlpha) sVent.setAlpha(Number(d.smooth.vent) || 0); if (sFlow.setAlpha) sFlow.setAlpha(Number(d.smooth.flow) || 0); } }catch(e){}
+  // For numeric displays, prefer the smoothed value from the strip if available; apply a small EMA here
+  // to further reduce jitter and ensure numbers move smoothly with the graphs.
+  const alpha_attraw = (d.smooth && typeof d.smooth.atr === 'number') ? Number(d.smooth.atr) : 1.0;
+  const alpha_ventraw = (d.smooth && typeof d.smooth.vent === 'number') ? Number(d.smooth.vent) : 1.0;
+  const alpha_flowraw = (d.smooth && typeof d.smooth.flow === 'number') ? Number(d.smooth.flow) : 1.0;
+  const sAtrVal = (sAtr.getSmoothed && sAtr.getSmoothed() != null) ? sAtr.getSmoothed() : atrRawScaled;
+  const sVentVal = (sVent.getSmoothed && sVent.getSmoothed() != null) ? sVent.getSmoothed() : ventRawScaled;
+  const sFlowVal = (sFlow.getSmoothed && sFlow.getSmoothed() != null) ? sFlow.getSmoothed() : flowRawScaled;
+  // initialize displays on first run
+  if (_dispAtr === null) _dispAtr = sAtrVal;
+  if (_dispVent === null) _dispVent = sVentVal;
+  if (_dispFlow === null) _dispFlow = sFlowVal;
+  // apply EMA using the same alpha as the strip (keeps numbers tied to graphs)
+  _dispAtr = (_dispAtr * (1 - alpha_attraw)) + (sAtrVal * alpha_attraw);
+  _dispVent = (_dispVent * (1 - alpha_ventraw)) + (sVentVal * alpha_ventraw);
+  _dispFlow = (_dispFlow * (1 - alpha_flowraw)) + (sFlowVal * alpha_flowraw);
+  // Round atrium and ventricle displays to nearest integer (pressure values)
+  setNum('n-atr', Math.round(_dispAtr), 0); setNum('n-vent', Math.round(_dispVent), 0); setNum('n-flow', _dispFlow, 2); setNum('n-pwm', d.pwm,0);
     if($('n-valve')) $('n-valve').textContent = d.valve? '▲' : '▼';
     // Blood pressure detection (client-side): record max ventricular pressure per valve segment
     if($('n-bp')){
@@ -355,11 +400,13 @@ static void sse_task(void*){
         "{\"mode\":%d,\"paused\":%d,\"pwmSet\":%d,\"pwm\":%d,\"valve\":%d,\"bpm\":%d,\"loopMs\":%.3f,"
         "\"atr_mmHg\":%.3f,\"vent_mmHg\":%.3f,\"flow_L_min\":%.3f,"
         "\"atr_raw\":%d,\"vent_raw\":%d,\"flow_hz\":%.3f,"
-        "\"cal\":{\"atr_m\":%.6f,\"atr_b\":%.6f,\"vent_m\":%.6f,\"vent_b\":%.6f,\"flow_m\":%.6f,\"flow_b\":%.6f}}",
+        "\"cal\":{\"atr_m\":%.6f,\"atr_b\":%.6f,\"vent_m\":%.6f,\"vent_b\":%.6f,\"flow_m\":%.6f,\"flow_b\":%.6f},"
+        "\"smooth\":{\"atr\":%.3f,\"vent\":%.3f,\"flow\":%.3f}}",
         mode, paused, pwmSet, pwm, valve, bpm, loop,
         atr, ven, fl,
         G.atr_raw.load(), G.vent_raw.load(), G.flow_hz.load(),
-        G.atr_m.load(), G.atr_b.load(), G.vent_m.load(), G.vent_b.load(), G.flow_m.load(), G.flow_b.load());
+        G.atr_m.load(), G.atr_b.load(), G.vent_m.load(), G.vent_b.load(), G.flow_m.load(), G.flow_b.load(),
+        (double)g_smooth_atr, (double)g_smooth_vent, (double)g_smooth_flow);
     if (n>0) sse.send(buf, "message", millis());
     vTaskDelayUntil(&wake, per);
   }
@@ -454,6 +501,18 @@ void web_start(){
   });
   server.on("/api/toggle", HTTP_GET, [](AsyncWebServerRequest* r){
     post_or_inline({CMD_TOGGLE,0}); r->send(204);
+  });
+
+  // Live smoothing endpoint - set smoothing alphas for atr/vent/flow (query params 'atr','vent','flow')
+  server.on("/api/smooth", HTTP_GET, [](AsyncWebServerRequest* r){
+    bool updated = false;
+    if (r->hasParam("atr")){
+      float v = r->getParam("atr")->value().toFloat(); if (v<0) v=0; if (v>1) v=1; g_smooth_atr = v; updated = true; }
+    if (r->hasParam("vent")){
+      float v = r->getParam("vent")->value().toFloat(); if (v<0) v=0; if (v>1) v=1; g_smooth_vent = v; updated = true; }
+    if (r->hasParam("flow")){
+      float v = r->getParam("flow")->value().toFloat(); if (v<0) v=0; if (v>1) v=1; g_smooth_flow = v; updated = true; }
+    if (updated) r->send(200, "application/json", "{\"ok\":true}"); else r->send(400);
   });
 
   // SSE
