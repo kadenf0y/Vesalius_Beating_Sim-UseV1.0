@@ -51,6 +51,15 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .seg button.active{background:#142033;color:var(--ink)}
   .row{display:flex;gap:8px;align-items:center;justify-content:space-between}
   .btn{padding:6px 8px;border-radius:8px;border:1px solid var(--grid);background:#0f1317;color:var(--ink);cursor:pointer;min-width:40px}
+  .btn-full{width:100%}
+  /* Blood pressure numeric value should be plain white for contrast */
+  #n-bp{color:#ffffff}
+  /* POWER buttons use the PWM graph color (violet) */
+  .btn-power{background:var(--violet);color:var(--ink);border-color:rgba(167,139,250,0.22)}
+  .btn-power:hover{filter:brightness(1.05)}
+  /* Mode buttons use the Valve graph color (green) */
+  #modeSeg button{color:var(--green)}
+  #modeSeg button.active{background:#0a2b12;color:var(--ink);border-color:rgba(34,197,94,0.18)}
   .btn-play{background:#0f3f11;color:#eaffef;border-color:#244f1d}
   .btn-pause{background:#3b0f0f;color:#ffecec;border-color:#5a1616}
   @media (max-width:900px){ .main{grid-template-columns:1fr} }
@@ -82,22 +91,25 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div class="panel big"><div class="big"><div class="val val-cyan" id="n-atr">—</div><div class="muted">Atrium mmHg</div></div></div>
       <div class="panel big"><div class="big"><div class="val val-red" id="n-vent">—</div><div class="muted">Ventricle mmHg</div></div></div>
       <div class="panel big"><div class="big"><div class="val val-amber" id="n-flow">—</div><div class="muted">Flow L/min</div></div></div>
-      <div class="panel big"><div class="big"><div class="val val-green" id="n-valve">-</div><div class="muted">Valve ▲=1 ▼=0</div></div></div>
+  <div class="panel big"><div class="big"><div class="muted">Atrium</div><div class="val val-green" id="n-valve">-</div><div class="muted">Ventrical</div></div></div>
     <div class="panel big"><div class="big"><div class="val val-violet" id="n-pwm">—</div><div class="muted">POWER</div></div></div>
     </div>
 
-    <div class="panel controls">
-      <div style="width:100%"><button id="btnToggle" class="btn btn-play">Play</button></div>
+    <div class="col" style="grid-template-rows:repeat(5,1fr)">
+  <div class="panel big"><div class="big"><div class="muted">Blood Pressure</div><div class="val val-green" id="n-bp">N/A</div><div style="color:var(--ink);font-size:12px">mmHg</div><div class="muted">SYS/DIA</div></div></div>
+
+      <div class="panel controls" style="grid-row:span 4">
+  <div style="width:100%"><button id="btnToggle" class="btn btn-play btn-full">Play</button></div>
       <div class="row" style="width:100%"><label class="muted">Mode</label>
         <div class="seg" id="modeSeg"><button data-m="0">Forward</button><button data-m="1">Reverse</button><button data-m="2">Beat</button></div>
       </div>
       <div class="row" style="width:100%"><label class="muted">POWER</label>
         <div class="ctrl">
           <div style="display:flex;flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
-            <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
-              <button id="btnPwmPlus" class="btn">+5</button>
-              <input id="pwmIn" type="number" min="0" max="255" value="0" style="width:72px;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
-              <button id="btnPwmMinus" class="btn">-5</button>
+            <div style="display:flex;flex-direction:column;align-items:stretch;width:100%;gap:6px">
+              <button id="btnPwmPlus" class="btn btn-full btn-power">+5</button>
+              <input id="pwmIn" type="number" min="0" max="255" value="0" style="width:72px;align-self:center;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
+              <button id="btnPwmMinus" class="btn btn-full btn-power">-5</button>
             </div>
             <div style="flex:1;min-width:8px"></div>
           </div>
@@ -106,16 +118,17 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div class="row" style="width:100%"><label class="muted">BPM</label>
         <div class="ctrl">
           <div style="display:flex;flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
-            <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
-              <button id="btnBpmPlus" class="btn">+5</button>
-              <input id="bpmIn" type="number" min="1" max="60" value="30" style="width:72px;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
-              <button id="btnBpmMinus" class="btn">-5</button>
+            <div style="display:flex;flex-direction:column;align-items:stretch;width:100%;gap:6px">
+              <button id="btnBpmPlus" class="btn btn-full">+5</button>
+              <input id="bpmIn" type="number" min="1" max="60" value="30" style="width:72px;align-self:center;text-align:center;padding:6px;border-radius:6px;border:1px solid var(--grid);background:#0f1317;color:var(--ink)">
+              <button id="btnBpmMinus" class="btn btn-full">-5</button>
             </div>
             <div style="flex:1;min-width:8px"></div>
           </div>
         </div>
       </div>
-      <div style="margin-top:6px"><a href="/cal" class="btn" style="text-decoration:none;display:inline-block">Calibration</a></div>
+  <div style="margin-top:6px"><a href="/cal" class="btn btn-full" style="text-decoration:none;display:inline-block;text-align:center">Calibration</a></div>
+  <div style="margin-top:6px"><a href="http://192.168.4.1/stream/view" class="btn btn-full" style="text-decoration:none;display:inline-block;text-align:center">Stream</a></div>
     </div>
   </div>
 
@@ -191,8 +204,15 @@ if($('btnPwmMinus')) $('btnPwmMinus').addEventListener('click',()=>{ adjustPwm(-
 if($('btnBpmPlus')) $('btnBpmPlus').addEventListener('click',()=>{ adjustBpm(5); });
 if($('btnBpmMinus')) $('btnBpmMinus').addEventListener('click',()=>{ adjustBpm(-5); });
 // auto-apply: also post when input values change
-if($('pwmIn')) $('pwmIn').addEventListener('change', ()=>{ const v=Number($('pwmIn').value||0); post('/api/pwm?duty='+Math.max(0,Math.min(255,v))); });
-if($('bpmIn')) $('bpmIn').addEventListener('change', ()=>{ const v=Number($('bpmIn').value||30); post('/api/bpm?b='+Math.max(1,Math.min(60,v))); });
+if($('pwmIn')){
+  $('pwmIn').addEventListener('change', ()=>{ const v=Number($('pwmIn').value||0); post('/api/pwm?duty='+Math.max(0,Math.min(255,v))); });
+  // allow Enter to submit while typing
+  $('pwmIn').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); const v=Number($('pwmIn').value||0); post('/api/pwm?duty='+Math.max(0,Math.min(255,v))); $('pwmIn').blur(); } });
+}
+if($('bpmIn')){
+  $('bpmIn').addEventListener('change', ()=>{ const v=Number($('bpmIn').value||30); post('/api/bpm?b='+Math.max(1,Math.min(60,v))); });
+  $('bpmIn').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); const v=Number($('bpmIn').value||30); post('/api/bpm?b='+Math.max(1,Math.min(60,v))); $('bpmIn').blur(); } });
+}
 document.querySelectorAll('#modeSeg button').forEach(b=> b.addEventListener('click', e=>{ post('/api/mode?m='+b.dataset.m); }));
 
 function adjustPwm(d){ const el=$('pwmIn'); if(!el) return; let v=Number(el.value||0); v = Math.max(0, Math.min(255, v + d)); el.value = v; post('/api/pwm?duty='+v); }
@@ -200,6 +220,8 @@ function adjustBpm(d){ const el=$('bpmIn'); if(!el) return; let v=Number(el.valu
 
 // SSE receiver — uses server keys: atr_mmHg, vent_mmHg, flow_L_min, pwmSet, pwm, valve, mode, bpm, loopMs
 const es = new EventSource('/stream'); let last=performance.now(), ema=0;
+// Blood-pressure detection state (client-side): collect max vent per valve segment
+const bpState = { lastValve: null, curMaxVent: null, systolic: null, diastolic: null, lastDisplay: null };
 es.onopen=()=>$('sse')? $('sse').textContent='OPEN' : null; es.onerror=()=>$('sse')? $('sse').textContent='ERR' : null;
 es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; const fps=1000/Math.max(1,dt); ema= ema? (ema*0.98 + fps*0.02) : fps; if($('fps')) $('fps').textContent=Math.round(ema);
   try{ const d=JSON.parse(ev.data);
@@ -207,8 +229,59 @@ es.onmessage=(ev)=>{ const now=performance.now(); const dt=now-last; last=now; c
   sValve.push(d.valve?1:0); sPwm.push(Number(d.pwm)||0);
     setNum('n-atr', d.atr_mmHg, 1); setNum('n-vent', d.vent_mmHg, 1); setNum('n-flow', d.flow_L_min, 2); setNum('n-pwm', d.pwm,0);
     if($('n-valve')) $('n-valve').textContent = d.valve? '▲' : '▼';
-    document.querySelectorAll('#modeSeg button').forEach(b=> b.classList.toggle('active', Number(b.dataset.m)===Number(d.mode||0)));
-  if($('pwmIn')) $('pwmIn').value = d.pwmSet||0; if($('bpmIn')) $('bpmIn').value = d.bpm||0; if(d.loopMs && $('loop')) $('loop').textContent = Number(d.loopMs).toFixed(2)+' ms';
+    // Blood pressure detection (client-side): record max ventricular pressure per valve segment
+    if($('n-bp')){
+      try{
+        const modeN = Number(d.mode);
+        const pausedN = Number(d.paused);
+        const valveN = Number(d.valve);
+        const vent = Number(d.vent_mmHg) || 0;
+        // Only run when in BEAT mode and unpaused
+        if (modeN===2 && pausedN===0){
+          if (bpState.lastValve === null){
+            // initialize on first beat
+            bpState.lastValve = valveN;
+            bpState.curMaxVent = vent;
+            bpState.systolic = null; bpState.diastolic = null; bpState.lastDisplay = null;
+            // remain N/A until first full pair is captured
+            $('n-bp').textContent = 'N/A';
+          } else {
+            if (valveN === bpState.lastValve){
+              // same segment: update max
+              if (vent > bpState.curMaxVent) bpState.curMaxVent = vent;
+            } else {
+              // valve changed -> finalize the just-completed segment
+              if (bpState.lastValve === 0) bpState.diastolic = bpState.curMaxVent;
+              else if (bpState.lastValve === 1) bpState.systolic = bpState.curMaxVent;
+              // start new segment
+              bpState.lastValve = valveN;
+              bpState.curMaxVent = vent;
+              // if we have both, update display and reset for next cycle
+              if (bpState.systolic != null && bpState.diastolic != null){
+                const S = Math.round(bpState.systolic), D = Math.round(bpState.diastolic);
+                // Unit ("mmHg") is already shown in the panel HTML; keep the displayed text numeric only.
+                bpState.lastDisplay = S + '/' + D;
+                $('n-bp').textContent = bpState.lastDisplay;
+                bpState.systolic = null; bpState.diastolic = null;
+              } else {
+                // keep lastDisplay (do not flash N/A between segments)
+                if (bpState.lastDisplay) $('n-bp').textContent = bpState.lastDisplay;
+              }
+            }
+          }
+        } else {
+          // not running/beat -> clear state and show N/A
+          bpState.lastValve = null; bpState.curMaxVent = null; bpState.systolic = null; bpState.diastolic = null;
+          $('n-bp').textContent = 'N/A';
+        }
+      }catch(e){ $('n-bp').textContent = 'N/A'; }
+    }
+      document.querySelectorAll('#modeSeg button').forEach(b=> b.classList.toggle('active', Number(b.dataset.m)===Number(d.mode||0)));
+      // Only update input values when the user is not actively typing in them
+      const pwmEl = $('pwmIn'); const bpmEl = $('bpmIn');
+      if(pwmEl && document.activeElement !== pwmEl) pwmEl.value = d.pwmSet||0;
+      if(bpmEl && document.activeElement !== bpmEl) bpmEl.value = d.bpm||0;
+      if(d.loopMs && $('loop')) $('loop').textContent = Number(d.loopMs).toFixed(2)+' ms';
     if($('btnToggle')){
       const b=$('btnToggle'); if(Number(d.paused||0)===0){ b.textContent='Pause'; b.classList.remove('btn-play'); b.classList.add('btn-pause'); } else { b.textContent='Play'; b.classList.remove('btn-pause'); b.classList.add('btn-play'); }
     }
