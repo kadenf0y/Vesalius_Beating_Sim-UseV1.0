@@ -132,10 +132,15 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
           </div>
         </div>
       </div>
+  <div style="margin-top:6px">
+    <label class="muted" style="display:block;margin-bottom:6px">Window: <b id="winLabel">5</b>s</label>
+    <input id="winRange" type="range" min="5" max="60" step="1" value="5" style="width:100%">
+  </div>
   <div style="margin-top:6px"><a href="/cal" class="btn btn-full" style="text-decoration:none;display:inline-block;text-align:center">Calibration</a></div>
   <div style="margin-top:6px"><a href="http://192.168.4.1/stream/view" class="btn btn-full" style="text-decoration:none;display:inline-block;text-align:center">Stream</a></div>
     </div>
   </div>
+
 
 <script>
 // small helpers
@@ -168,7 +173,9 @@ function makeStrip(id, cfg){ const c=$(id);
     return { push: noop, render: noop, getSmoothed: ()=>null, setAlpha: noop };
   }
   const ctx = c.getContext && c.getContext('2d'); if(!ctx){ const noop = ()=>{}; return { push: noop, render: noop, getSmoothed: ()=>null, setAlpha: noop }; }
-  const buf=[]; const WIN=5.0;
+  const buf=[];
+  // Window length (seconds) is dynamic and read from global `window.winSec` (default 5s).
+  function getWin(){ return (typeof window.winSec === 'number' && window.winSec>0) ? window.winSec : 5.0; }
   let lastW=0, lastH=0;
   // optional smoothing: cfg.smoothAlpha in (0..1], higher -> more responsive, lower -> smoother
   let _prevSmoothed = null;
@@ -184,7 +191,7 @@ function makeStrip(id, cfg){ const c=$(id);
       else _prevSmoothed = (_prevSmoothed * (1 - _alpha)) + (outV * _alpha);
       outV = _prevSmoothed;
     }
-    buf.push({t,v:outV}); while(buf.length && (t - buf[0].t) > WIN) buf.shift(); requestStripRender(); }
+    buf.push({t,v:outV}); while(buf.length && (t - buf[0].t) > getWin()) buf.shift(); requestStripRender(); }
   function render(){ fitCanvas(c,ctx); const W=c.width,H=c.height;
     // if resized, clear and redraw background grid
     if (W!==lastW || H!==lastH){ ctx.clearRect(0,0,W,H); drawGrid(ctx,W,H); lastW=W; lastH=H; }
@@ -194,23 +201,24 @@ function makeStrip(id, cfg){ const c=$(id);
     // caused by incremental background overdraw or compositing seams.
     ctx.clearRect(0, 0, W, H);
     drawGrid(ctx, W, H);
-    const X = t => ((t % WIN) / WIN) * W;
+  const win = getWin();
+  const X = t => ((t % win) / win) * W;
     const Y = v => H - ((Math.max(cfg.min,Math.min(cfg.max,v)) - cfg.min)/(cfg.max-cfg.min)) * H;
     ctx.lineWidth = 2; ctx.strokeStyle = cfg.color; ctx.globalAlpha = 1; ctx.lineJoin='round'; ctx.lineCap='round';
 
     // draw segments. If cfg.step is true, render as horizontal steps with vertical transitions
     // We compute an "erase-ahead" region in pixels and fade samples that fall inside it.
-    const last = buf[buf.length-1];
-    const xb_latest = X(last.t);
-    const gap = 8; // px gap in front of newest sample to keep visible
+  const last = buf[buf.length-1];
+  const xb_latest = X(last.t);
+  const gap = 8; // px gap in front of newest sample to keep visible
     const eraseFull = 50; // fully erased region after the gap
     const fadeEnd = 100;  // fade to opaque by this distance after the gap
     const totalW = fadeEnd;
     // helper: distance forward from xb_latest to x in pixels (0..W)
     function distAheadPx(x){ let d = x - xb_latest; if (d < 0) d += W; return d; }
-    function alphaFromDist(d){ if (d <= gap + eraseFull) return 0; if (d >= gap + fadeEnd) return 1; return (d - (gap + eraseFull)) / (fadeEnd - eraseFull); }
+  function alphaFromDist(d){ if (d <= gap + eraseFull) return 0; if (d >= gap + fadeEnd) return 1; return (d - (gap + eraseFull)) / (fadeEnd - eraseFull); }
     for(let i=1;i<buf.length;i++){
-      const a = buf[i-1], b = buf[i]; const ta = a.t % WIN, tb = b.t % WIN;
+      const a = buf[i-1], b = buf[i]; const ta = a.t % win, tb = b.t % win;
       const xa = X(a.t), xb = X(b.t);
       // wrapped: draw a small dot at xb
       if (tb < ta){
@@ -292,12 +300,13 @@ function makeStrip(id, cfg){ const c=$(id);
       }
       ctx.restore();
     }catch(e){ /* safe: ignore erase if anything fails */ }
-  }
+    }
   window.addEventListener('resize', ()=>{ lastW=0; lastH=0; render(); });
   // expose getSmoothed and setAlpha to allow numeric displays and remote control to read/update smoothing
   function getSmoothed(){ return _prevSmoothed; }
   function setAlpha(a){ if (typeof a === 'number'){ _alpha = Math.max(0, Math.min(1, a)); } }
-  return { push, render, getSmoothed, setAlpha }; }
+  function prune(){ if(!buf.length) return; const win = getWin(); const now = buf[buf.length-1].t; while(buf.length && (now - buf[0].t) > win) buf.shift(); }
+  return { push, render, getSmoothed, setAlpha, prune }; }
 
 // Apply light exponential smoothing to physiological traces so they look less noisy
 // but remain responsive. Tunable via smoothAlpha (0..1). Lower = smoother, Higher = more responsive.
@@ -307,6 +316,17 @@ const sFlow= makeStrip('cv-flow',{min:0,max:7.5,color:'#f59e0b', smoothAlpha:0.2
 const sValve=makeStrip('cv-valve',{min:0,max:1,color:'#22c55e', step:true});
 // PWM should display actual hardware values (no client-side smoothing)
 const sPwm = makeStrip('cv-pwm',{min:0,max:255,color:'#a78bfa', step:true});
+// Initialize window slider (global window.winSec). Keep default in localStorage or 5s.
+window.winSec = Number(localStorage.getItem('winSec')) || 5;
+// Wire the slider (if present) to update window.winSec and prune existing buffers.
+try{
+  const _winLabel = $('winLabel'); const _winRange = $('winRange');
+  if(_winRange){ _winRange.value = window.winSec; if(_winLabel) _winLabel.textContent = window.winSec; _winRange.addEventListener('input', (e)=>{
+    window.winSec = Number(e.target.value)|0; if(_winLabel) _winLabel.textContent = window.winSec; localStorage.setItem('winSec', window.winSec);
+    try{ [sAtr,sVent,sFlow,sValve,sPwm].forEach(s=> s && s.prune && s.prune()); }catch(e){}
+    requestStripRender();
+  }); }
+}catch(e){}
 
 // Centralized render request: schedule a single rAF to render all strips. This
 // avoids multiple paints per incoming SSE message (we update several strips

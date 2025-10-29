@@ -102,7 +102,7 @@ static void control_task(void* /*arg*/){
     pwm_out = clamp8(next);
     io_write_pwm(pwm_out);
   };
-  auto forceOutputsOff = [&](){ pwm_out = 0; io_write_pwm(0); valve_dir = VALVE_FWD; io_write_valve(valve_dir); };
+  auto forceOutputsOff = [&](){ pwm_out = 0; pwm_out_f = (float)pwm_out; io_write_pwm(0); valve_dir = VALVE_FWD; io_write_valve(valve_dir); };
 
   for(;;){
     // timing
@@ -119,6 +119,10 @@ static void control_task(void* /*arg*/){
         if (paused){
           // unpause -> immediate valve direction set and begin ramp up
           G.paused.store(0);
+          // Ensure beat state machine starts from ramp-up so a low-BPM beat
+          // begins immediately instead of waiting out a long hold period.
+          // bstate and bstateT are local to this task, so update them here.
+          bstate = 0; bstateT = millis();
           // valve and ramp-up handled below on running path using need_dir/pwm_set
         } else {
           // request pending pause: finish ramp to zero then set paused
@@ -126,6 +130,12 @@ static void control_task(void* /*arg*/){
         }
       } else if (cmd.t == CMD_SET_PWM){
         int v = cmd.i; if (v<0) v=0; if (v>255) v=255; G.pwmSet.store(v);
+        // If we're currently running in BEAT mode, start the beat state machine
+        // from ramp-up so the hardware begins moving to the new setpoint
+        // immediately instead of waiting out the current hold/dead interval.
+        if (G.mode.load() == MODE_BEAT && G.paused.load() == 0){
+          bstate = 0; bstateT = millis();
+        }
       } else if (cmd.t == CMD_SET_BPM){
         int b = cmd.i; if (b<1) b=1; if (b>60) b=60; G.bpm.store(b); beatHoldMs = compute_half_hold_ms();
       } else if (cmd.t == CMD_SET_MODE){
@@ -198,6 +208,7 @@ static void control_task(void* /*arg*/){
           // decrement per-tick roughly
           int next = (int)pwm_out - (int)roundf(255.0f / (RAMP_MS/(1000.0f/CONTROL_HZ)));
           pwm_out = clamp8(next);
+          pwm_out_f = (float)pwm_out;
           io_write_pwm(pwm_out);
         } else {
           // reached zero: mark paused and force valve off
