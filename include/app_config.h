@@ -26,7 +26,7 @@ static constexpr float    FLOW_TARGET_EDGES= 10.0f * 2.0f;   // aim ~10 pulses â
 
 // ===== LEDC PWM (pump) =====
 // 6 kHz carrier, 8-bit resolution, duty 0..255 matches requested behavior.
-static constexpr uint32_t PUMP_PWM_FREQ_HZ = 6000;
+static constexpr uint32_t PUMP_PWM_FREQ_HZ = 12000;
 static constexpr uint8_t  PUMP_PWM_BITS    = 8;
 static constexpr uint8_t  PUMP_LEDC_TIMER  = 0;
 static constexpr uint8_t  PUMP_LEDC_CH     = 0;
@@ -34,8 +34,8 @@ static constexpr uint8_t  PUMP_LEDC_CH     = 0;
 // ===== Pins (ESP32 Dev Module) =====
 static constexpr uint8_t PIN_PUMP_PWM      = 19;  // LEDC out
 static constexpr uint8_t PIN_VALVE         = 23;  // digital out (0=FWD, 1=REV)
-static constexpr uint8_t PIN_PRESS_ATR     = 32;  // ADC1
-static constexpr uint8_t PIN_PRESS_VENT    = 33;  // ADC1
+static constexpr uint8_t PIN_PRESS_ATR     = 32;  // ADC1 32
+static constexpr uint8_t PIN_PRESS_VENT    = 33;  // ADC1 33
 static constexpr uint8_t PIN_FLOW          = 27;  // pulse in
 static constexpr uint8_t PIN_BTN_A         = 14;  // Play/Pause (active LOW)
 static constexpr uint8_t PIN_BTN_B         = 13;  // PWM Â± (active LOW)
@@ -74,8 +74,8 @@ static constexpr float FLOW_HZ_PER_LPM = 23.6f;
 
 // ===== Calibration defaults (y = m*x + b) =====
 struct Cal2 { float m, b; };
-static constexpr Cal2 CAL_ATR_DEFAULT  { 1.0f, 0.0f };
-static constexpr Cal2 CAL_VENT_DEFAULT { 1.0f, 0.0f };
+static constexpr Cal2 CAL_ATR_DEFAULT  { 0.1227f, -177.81f };
+static constexpr Cal2 CAL_VENT_DEFAULT { 0.1236f, -171.28f };
 static constexpr Cal2 CAL_FLOW_DEFAULT { 1.0f/23.6f, 0.0f }; // default: L/min = Hz/23.6
 
 // ===== Web UI color & ranges (mirrored in UI object too) =====
